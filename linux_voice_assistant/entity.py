@@ -7,11 +7,14 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ListEntitiesMediaPlayerResponse,
     ListEntitiesRequest,
     ListEntitiesSwitchResponse,
+    ListEntitiesNumberResponse,
     MediaPlayerCommandRequest,
     MediaPlayerStateResponse,
     SubscribeHomeAssistantStatesRequest,
     SwitchCommandRequest,
     SwitchStateResponse,
+    NumberCommandRequest,
+    NumberStateResponse,
 )
 from aioesphomeapi.model import (
     MediaPlayerCommand,
@@ -222,27 +225,22 @@ class MuteSwitchEntity(ESPHomeEntity):
         self.object_id = object_id
         self._get_muted = get_muted
         self._set_muted = set_muted
-        self._switch_state = self._get_muted()  # Sync internal state with actual muted value on init
+        self._switch_state = self._get_muted()
 
     def update_get_muted(self, get_muted: Callable[[], bool]) -> None:
-        # Update the callback used to read the mute state.
         self._get_muted = get_muted
 
     def update_set_muted(self, set_muted: Callable[[bool], None]) -> None:
-        # Update the callback used to change the mute state.
         self._set_muted = set_muted
 
     def sync_with_state(self) -> None:
-        # Sync internal switch state with the actual mute state.
         self._switch_state = self._get_muted()
 
     def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
         if isinstance(msg, SwitchCommandRequest) and (msg.key == self.key):
-            # User toggled the switch - update our internal state and trigger actions
             new_state = bool(msg.state)
             self._switch_state = new_state
             self._set_muted(new_state)
-            # Return the new state immediately
             yield SwitchStateResponse(key=self.key, state=self._switch_state)
         elif isinstance(msg, ListEntitiesRequest):
             yield ListEntitiesSwitchResponse(
@@ -253,6 +251,51 @@ class MuteSwitchEntity(ESPHomeEntity):
                 icon="mdi:microphone-off",
             )
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
-            # Always return our internal switch state
             self.sync_with_state()
             yield SwitchStateResponse(key=self.key, state=self._switch_state)
+
+
+class NumberEntity(ESPHomeEntity):
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        get_value: Callable[[], float],
+        set_value: Callable[[float], None],
+        min_value: float,
+        max_value: float,
+        step: float,
+    ) -> None:
+        ESPHomeEntity.__init__(self, server)
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._get_value = get_value
+        self._set_value = set_value
+        self.min_value = min_value
+        self.max_value = max_value
+        self.step = step
+
+    def update_callbacks(self, get_value: Callable[[], float], set_value: Callable[[float], None]) -> None:
+        self._get_value = get_value
+        self._set_value = set_value
+
+    def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
+        if isinstance(msg, NumberCommandRequest) and (msg.key == self.key):
+            self._set_value(float(msg.state))
+            yield NumberStateResponse(key=self.key, state=self._get_value())
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesNumberResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                min_value=self.min_value,
+                max_value=self.max_value,
+                step=self.step,
+                entity_category=EntityCategory.CONFIG,
+                icon="mdi:tune-vertical",
+            )
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            yield NumberStateResponse(key=self.key, state=self._get_value())

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from collections.abc import Iterable
 from typing import Dict, Optional, Set, Union
 
@@ -17,6 +18,7 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     SubscribeHomeAssistantStatesRequest,
     DisconnectRequest,
     SwitchCommandRequest,
+    NumberCommandRequest,
     VoiceAssistantAnnounceFinished,
     VoiceAssistantAnnounceRequest,
     VoiceAssistantAudio,
@@ -41,9 +43,9 @@ from pymicro_wakeword import MicroWakeWord
 from pyopen_wakeword import OpenWakeWord
 
 from .api_server import APIServer
-from .entity import MediaPlayerEntity, MuteSwitchEntity
+from .entity import MediaPlayerEntity, MuteSwitchEntity, NumberEntity
 from .models import ServerState
-from .util import call_all
+from .util import call_all, run_command
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,11 +117,30 @@ class VoiceSatelliteProtocol(APIServer):
         mute_switch.update_set_muted(self._set_muted)
         mute_switch.sync_with_state()
 
+        threshold = self.state.threshold_entity
+        if threshold is None:
+            threshold = NumberEntity(
+                server=self,
+                key=len(state.entities),
+                name="Wakeword Threshold",
+                object_id="wakeword_threshold",
+                get_value=lambda: self.state.wakeword_threshold,
+                set_value=lambda v: setattr(self.state, "wakeword_threshold", max(0.0, min(1.0, float(v)))),
+                min_value=0.0,
+                max_value=1.0,
+                step=0.01,
+            )
+            self.state.entities.append(threshold)
+            self.state.threshold_entity = threshold
+        elif threshold not in self.state.entities:
+            self.state.entities.append(threshold)
+
         self._is_streaming_audio = False
         self._tts_url: Optional[str] = None
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
+        self._thinking_played = False
 
         self._disconnect_event = asyncio.Event()
 
@@ -148,11 +169,17 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_url = data.get("url")
             self._tts_played = False
             self._continue_conversation = False
+            self._thinking_played = False
+            run_command(self.state.synthesize_command)
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
+            run_command(self.state.wake_command)
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
             self._is_streaming_audio = False
+            run_command(self.state.sst_stop_command)
+            self._play_thinking_sound()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
             if data.get("tts_start_streaming") == "1":
                 # Start streaming early
@@ -163,6 +190,7 @@ class VoiceSatelliteProtocol(APIServer):
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_END:
             self._tts_url = data.get("url")
             self.play_tts()
+            run_command(self.state.tts_played_command)
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
             self._is_streaming_audio = False
             if not self._tts_played:
@@ -241,6 +269,7 @@ class VoiceSatelliteProtocol(APIServer):
                 SubscribeHomeAssistantStatesRequest,
                 MediaPlayerCommandRequest,
                 SwitchCommandRequest,
+                NumberCommandRequest,
             ),
         ):
             for entity in self.state.entities:
@@ -350,6 +379,21 @@ class VoiceSatelliteProtocol(APIServer):
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
         self.state.music_player.unduck()
+
+    def _play_thinking_sound(self) -> None:
+        if self._thinking_played:
+            return
+        try:
+            sound = getattr(self.state, "thinking_sound", None)
+            if not sound:
+                return
+            path = Path(sound)
+            if not path.is_file():
+                return
+            self._thinking_played = True
+            self.state.tts_player.play(str(path))
+        except Exception:
+            _LOGGER.exception("Failed to play thinking sound")
 
     def _tts_finished(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)

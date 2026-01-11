@@ -1,9 +1,12 @@
 """Utility methods."""
 
 import uuid
+import logging
 from collections.abc import Callable
 from typing import Optional
+import subprocess
 
+_LOGGER = logging.getLogger(__name__)
 
 def get_mac() -> str:
     mac = uuid.getnode()
@@ -14,3 +17,11 @@ def get_mac() -> str:
 def call_all(*callables: Optional[Callable[[], None]]) -> None:
     for item in filter(None, callables):
         item()
+
+def run_command(command: Optional[str]) -> None:
+    if not command:
+        return
+
+    _LOGGER.debug("Running %s", command)
+
+    subprocess.Popen(command, shell=True)

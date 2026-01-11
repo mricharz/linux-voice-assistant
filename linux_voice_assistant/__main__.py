@@ -33,7 +33,7 @@ _SOUNDS_DIR = _REPO_DIR / "sounds"
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True)
+    parser.add_argument("--name")
     parser.add_argument(
         "--audio-input-device",
         help="soundcard name for input device (see --list-input-devices)",
@@ -69,12 +69,52 @@ async def main() -> None:
         type=float,
         help="Seconds before wake word can be activated again",
     )
+    parser.add_argument(
+        "--wakeword-threshold",
+        type=float,
+        default=0.5,
+        help="Probability threshold (0-1) for wake word activation",
+    )
     #
     parser.add_argument(
         "--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac")
     )
     parser.add_argument(
+        "--thinking-sound", default=str(_SOUNDS_DIR / "processing.wav"),
+        help="Short sound to play while assistant is processing (thinking)"
+    )
+    parser.add_argument(
         "--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac")
+    )
+    parser.add_argument(
+        "--wake-command",
+        default=None,
+        type=str,
+        help="Command to run when wake word was triggered",
+    )
+    parser.add_argument(
+        "--sst-stop-command",
+        default=None,
+        type=str,
+        help="Command to run when the user stops speaking",
+    )
+    parser.add_argument(
+        "--synthesize-command",
+        default=None,
+        type=str,
+        help="Command to run when the response is generated",
+    )
+    parser.add_argument(
+        "--tts-played-command",
+        default=None,
+        type=str,
+        help="Command to run when tts was played",
+    )
+    parser.add_argument(
+        "--error-command",
+        default=None,
+        type=str,
+        help="Command to run when an error occurred",
     )
     #
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
@@ -112,6 +152,9 @@ async def main() -> None:
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
+
+    if (not args.name) and (not args.list_input_devices) and (not args.list_output_devices):
+        parser.error("the following arguments are required: --name")
 
     # Resolve microphone
     if args.audio_input_device is not None:
@@ -213,9 +256,16 @@ async def main() -> None:
         tts_player=MpvMediaPlayer(device=args.audio_output_device),
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
+        thinking_sound=args.thinking_sound,
         preferences=preferences,
         preferences_path=preferences_path,
         refractory_seconds=args.refractory_seconds,
+        wake_command=args.wake_command,
+        sst_stop_command=args.sst_stop_command,
+        synthesize_command=args.synthesize_command,
+        tts_played_command=args.tts_played_command,
+        error_command=args.error_command,
+        wakeword_threshold=args.wakeword_threshold,
     )
 
     process_audio_thread = threading.Thread(
@@ -318,7 +368,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                         elif isinstance(wake_word, OpenWakeWord):
                             for oww_input in oww_inputs:
                                 for prob in wake_word.process_streaming(oww_input):
-                                    if prob > 0.5:
+                                    if prob > state.wakeword_threshold:
                                         activated = True
 
                         if activated and not state.muted:
