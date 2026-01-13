@@ -171,7 +171,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._continue_conversation = False
             self._thinking_played = False
             run_command(self.state.synthesize_command)
-        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
             run_command(self.state.wake_command)
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,

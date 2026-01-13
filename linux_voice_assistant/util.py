@@ -4,6 +4,7 @@ import uuid
 import logging
 from collections.abc import Callable
 from typing import Optional
+import shlex
 import subprocess
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,7 +22,8 @@ def call_all(*callables: Optional[Callable[[], None]]) -> None:
 def run_command(command: Optional[str]) -> None:
     if not command:
         return
-
     _LOGGER.debug("Running %s", command)
-
-    subprocess.Popen(command, shell=True)
+    try:
+        subprocess.Popen(shlex.split(command), close_fds=True)
+    except Exception:
+        _LOGGER.exception("Failed to run command: %s", command)
