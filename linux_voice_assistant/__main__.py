@@ -395,14 +395,9 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
                 try:
-                    # Only send audio to HA while the pipeline is actively listening/streaming.
-                    # This avoids unnecessary network I/O and reduces CPU load.
-                    if getattr(sat, "is_streaming_audio", False):
-                        sat.handle_audio(audio_chunk)
-
                     # Enqueue audio for HA while streaming is active.
                     # Sending happens in the asyncio thread via `audio_sender()`.
-                    if getattr(sat, "is_streaming_audio", False):
+                    if streaming:
                         try:
                             state.audio_queue.put_nowait(audio_chunk)
                         except Full:
