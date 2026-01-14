@@ -454,6 +454,7 @@ class VoiceSatelliteProtocol(APIServer):
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
         )
         self.duck()
+        self._pipeline_active = True
         self._is_streaming_audio = True
 
         # Play wakeup beep without delaying microphone streaming.

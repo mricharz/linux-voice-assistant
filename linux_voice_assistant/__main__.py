@@ -30,28 +30,6 @@ _SOUNDS_DIR = _REPO_DIR / "sounds"
 
 # -----------------------------------------------------------------------------
 
-async def audio_sender(state: ServerState) -> None:
-    """Send audio chunks to Home Assistant from the asyncio thread.
-
-    Why:
-    - `process_audio()` runs in a background thread.
-    - Scheduling `send_messages()` (protobuf + network) via call_soon_threadsafe
-      for *every block* is expensive on small devices.
-    - Instead, we enqueue chunks and send them from a single asyncio task.
-    """
-    while True:
-        chunk = await asyncio.to_thread(state.audio_queue.get)
-        if chunk is None:
-            return
-
-        sat = state.satellite
-        if sat is None:
-            continue
-
-        # handle_audio() will no-op if streaming isn't active anymore
-        sat.handle_audio(chunk)
-
-
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name")
@@ -298,12 +276,15 @@ async def main() -> None:
     process_audio_thread.start()
 
     loop = asyncio.get_running_loop()
+    sender_thread = threading.Thread(
+        target=audio_sender_thread,
+        args=(state, loop),
+        daemon=True,
+    )
+    sender_thread.start()
     server = await loop.create_server(
         lambda: VoiceSatelliteProtocol(state), host=args.host, port=args.port
     )
-
-    # Single asyncio task that sends queued audio to HA
-    audio_task = asyncio.create_task(audio_sender(state))
 
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=args.name)
@@ -316,18 +297,62 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        state.audio_queue.put_nowait(None)
-        process_audio_thread.join()
         try:
-            await audio_task
-        except Exception:
-            _LOGGER.exception("Audio sender task crashed")
+            state.audio_queue.put_nowait(None)
+        except Full:
+            state.audio_queue.get_nowait()
+        except Empty:
+            pass
+        state.audio_queue.put_nowait(None)
+        sender_thread.join(timeout=2.0)
 
     _LOGGER.debug("Server stopped")
 
 
 # -----------------------------------------------------------------------------
+def enqueue_audio(state: ServerState, audio_chunk: bytes) -> None:
+    """Put audio into bounded queue, dropping oldest on overflow to keep latency low."""
+    try:
+        state.audio_queue.put_nowait(audio_chunk)
+    except Full:
+        try:
+            state.audio_queue.get_nowait()
+        except Empty:
+            pass
+        try:
+            state.audio_queue.put_nowait(audio_chunk)
+        except Full:
+            pass
 
+
+def _send_audio_batch(state: ServerState, batch: list[bytes]) -> None:
+    """Runs in asyncio thread (event loop)."""
+    sat = state.satellite
+    if sat is None:
+        return
+    if not getattr(sat, "is_streaming_audio", False):
+        return
+
+    from aioesphomeapi.api_pb2 import VoiceAssistantAudio  # local import avoids global overhead
+    sat.send_messages([VoiceAssistantAudio(data=b) for b in batch])
+
+
+def audio_sender_thread(state: ServerState, loop: asyncio.AbstractEventLoop, batch_size: int = 8) -> None:
+    """Blocking sender thread: batches audio and schedules 1 callback per batch."""
+    while True:
+        chunk = state.audio_queue.get()
+        if chunk is None:
+            return
+
+        batch = [chunk]
+        # Drain a few more to batch
+        for _ in range(batch_size - 1):
+            try:
+                batch.append(state.audio_queue.get_nowait())
+            except Empty:
+                break
+
+        loop.call_soon_threadsafe(_send_audio_batch, state, batch)
 
 def process_audio(state: ServerState, mic, block_size: int):
     """Process audio chunks from the microphone.
@@ -356,6 +381,7 @@ def process_audio(state: ServerState, mic, block_size: int):
         with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
             while True:
                 audio_chunk_array = mic_in.record(block_size).reshape(-1)
+                audio_chunk_array = np.nan_to_num(audio_chunk_array, nan=0.0, posinf=0.0, neginf=0.0)
                 audio_chunk = (
                     (audio_chunk_array * 32767.0)
                     .astype("<i2")  # little-endian 16-bit signed
@@ -396,43 +422,32 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
                 try:
-                    # Enqueue audio for HA while streaming is active.
-                    # Sending happens in the asyncio thread via `audio_sender()`.
-                    if pipeline_active:
+                    # Always suppress wakeword detection while a pipeline run is active.
+                    # Otherwise device audio / echo can retrigger wake words mid-run.
+                    if pipeline_active or streaming:
+                        # Send mic audio only while HA is actively streaming/listening
                         if streaming:
-                            try:
-                                state.audio_queue.put_nowait(audio_chunk)
-                            except Full:
-                                # Drop oldest chunk to keep latency low rather than blocking.
-                                try:
-                                    state.audio_queue.get_nowait()
-                                except Empty:
-                                    pass
-                                try:
-                                    state.audio_queue.put_nowait(audio_chunk)
-                                except Full:
-                                    pass
+                            enqueue_audio(state, audio_chunk)
 
-                            # Stop word detection: only when stop word is enabled/active.
-                            should_check_stop = (
+                        # Still allow stop-word detection during the whole run (STT, intent, TTS),
+                        # so user can interrupt TTS or cancel.
+                        should_check_stop = (
                                 (not state.muted)
                                 and (state.stop_word.id in state.active_wake_words)
-                            )
-                            if should_check_stop:
-                                # Ensure features are available
-                                if micro_features is None:
-                                    micro_features = MicroWakeWordFeatures()
+                        )
+                        if should_check_stop:
+                            if micro_features is None:
+                                micro_features = MicroWakeWordFeatures()
 
-                                micro_inputs.clear()
-                                micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+                            micro_inputs.clear()
+                            micro_inputs.extend(micro_features.process_streaming(audio_chunk))
 
-                                for micro_input in micro_inputs:
-                                    if state.stop_word.process_streaming(micro_input):
-                                        sat.stop()
-                                        break
+                            for micro_input in micro_inputs:
+                                if state.stop_word.process_streaming(micro_input):
+                                    sat.stop()
+                                    break
 
-                            # Important: do NOT run wake word detection while streaming
-                            continue
+                        continue  # <-- IMPORTANT: never run wake word detection during pipeline_active
 
                     assert micro_features is not None
                     micro_inputs.clear()
