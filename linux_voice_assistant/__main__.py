@@ -376,6 +376,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                 # - DO NOT run wake word models (wasteful and can add load/jitter)
                 # - optionally run stop-word detection (only if enabled)
                 streaming = getattr(sat, "is_streaming_audio", False)
+                pipeline_active = getattr(sat, "pipeline_active", False)
 
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
                     # Update list of wake word models to process
@@ -397,40 +398,41 @@ def process_audio(state: ServerState, mic, block_size: int):
                 try:
                     # Enqueue audio for HA while streaming is active.
                     # Sending happens in the asyncio thread via `audio_sender()`.
-                    if streaming:
-                        try:
-                            state.audio_queue.put_nowait(audio_chunk)
-                        except Full:
-                            # Drop oldest chunk to keep latency low rather than blocking.
-                            try:
-                                state.audio_queue.get_nowait()
-                            except Empty:
-                                pass
+                    if pipeline_active:
+                        if streaming:
                             try:
                                 state.audio_queue.put_nowait(audio_chunk)
                             except Full:
-                                pass
+                                # Drop oldest chunk to keep latency low rather than blocking.
+                                try:
+                                    state.audio_queue.get_nowait()
+                                except Empty:
+                                    pass
+                                try:
+                                    state.audio_queue.put_nowait(audio_chunk)
+                                except Full:
+                                    pass
 
-                        # Stop word detection: only when stop word is enabled/active.
-                        should_check_stop = (
-                            (not state.muted)
-                            and (state.stop_word.id in state.active_wake_words)
-                        )
-                        if should_check_stop:
-                            # Ensure features are available
-                            if micro_features is None:
-                                micro_features = MicroWakeWordFeatures()
+                            # Stop word detection: only when stop word is enabled/active.
+                            should_check_stop = (
+                                (not state.muted)
+                                and (state.stop_word.id in state.active_wake_words)
+                            )
+                            if should_check_stop:
+                                # Ensure features are available
+                                if micro_features is None:
+                                    micro_features = MicroWakeWordFeatures()
 
-                            micro_inputs.clear()
-                            micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+                                micro_inputs.clear()
+                                micro_inputs.extend(micro_features.process_streaming(audio_chunk))
 
-                            for micro_input in micro_inputs:
-                                if state.stop_word.process_streaming(micro_input):
-                                    sat.stop()
-                                    break
+                                for micro_input in micro_inputs:
+                                    if state.stop_word.process_streaming(micro_input):
+                                        sat.stop()
+                                        break
 
-                        # Important: do NOT run wake word detection while streaming
-                        continue
+                            # Important: do NOT run wake word detection while streaming
+                            continue
 
                     assert micro_features is not None
                     micro_inputs.clear()

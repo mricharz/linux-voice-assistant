@@ -160,6 +160,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.entities.append(threshold)
 
         # Streaming / pipeline state
+        self._pipeline_active = False
         self._is_streaming_audio = False
         self._tts_url: Optional[str] = None
         self._tts_played = False
@@ -173,6 +174,11 @@ class VoiceSatelliteProtocol(APIServer):
     def is_streaming_audio(self) -> bool:
         """True when microphone audio should be streamed to Home Assistant."""
         return self._is_streaming_audio and (not self.state.muted)
+
+    @property
+    def pipeline_active(self) -> bool:
+        """True while HA pipeline run is active (RUN_START..RUN_END/ERROR)."""
+        return self._pipeline_active
 
     def _set_muted(self, new_state: bool) -> None:
         self.state.muted = bool(new_state)
@@ -201,6 +207,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._thinking_played = False
+            self._pipeline_active = True
             self._is_streaming_audio = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
@@ -234,6 +241,7 @@ class VoiceSatelliteProtocol(APIServer):
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
             # End of pipeline run.
             self._is_streaming_audio = False
+            self._pipeline_active = False
             if not self._tts_played:
                 self._tts_finished()
             self._tts_played = False
@@ -243,6 +251,8 @@ class VoiceSatelliteProtocol(APIServer):
             # See ESPHome voice_assistant.cpp handling. :contentReference[oaicite:2]{index=2}
             code = data.get("code", "") or ""
             msg = data.get("message", "") or ""
+            self._pipeline_active = False
+            self._is_streaming_audio = False
             self._handle_pipeline_error(code, msg)
 
         # else: ignore unhandled events (but keep DEBUG logs)
@@ -525,6 +535,7 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
 
         self._disconnect_event.set()
+        self._pipeline_active = False
         self._is_streaming_audio = False
         self._tts_url = None
         self._tts_played = False

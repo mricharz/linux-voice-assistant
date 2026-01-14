@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Optional
 import shlex
 import subprocess
+import os
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,11 +20,20 @@ def call_all(*callables: Optional[Callable[[], None]]) -> None:
     for item in filter(None, callables):
         item()
 
-def run_command(command: Optional[str]) -> None:
+def run_command(command: Optional[str], env: Optional[dict] = None) -> None:
     if not command:
         return
     _LOGGER.debug("Running %s", command)
     try:
-        subprocess.Popen(shlex.split(command), close_fds=True)
+        merged_env = None
+        if env:
+            merged_env = dict(os.environ)
+            merged_env.update(env)
+
+        subprocess.Popen(
+            shlex.split(command),
+            close_fds=True,
+            env=merged_env,
+        )
     except Exception:
         _LOGGER.exception("Failed to run command: %s", command)
