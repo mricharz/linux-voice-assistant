@@ -328,7 +328,7 @@ def process_audio(state: ServerState, mic, block_size: int):
             while True:
                 audio_chunk_array = mic_in.record(block_size).reshape(-1)
                 audio_chunk = (
-                    (np.clip(audio_chunk_array, -1.0, 1.0) * 32767.0)
+                    (audio_chunk_array * 32767.0)
                     .astype("<i2")  # little-endian 16-bit signed
                     .tobytes()
                 )
