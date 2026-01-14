@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Full, Empty
 from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
@@ -29,6 +29,27 @@ _SOUNDS_DIR = _REPO_DIR / "sounds"
 
 
 # -----------------------------------------------------------------------------
+
+async def audio_sender(state: ServerState) -> None:
+    """Send audio chunks to Home Assistant from the asyncio thread.
+
+    Why:
+    - `process_audio()` runs in a background thread.
+    - Scheduling `send_messages()` (protobuf + network) via call_soon_threadsafe
+      for *every block* is expensive on small devices.
+    - Instead, we enqueue chunks and send them from a single asyncio task.
+    """
+    while True:
+        chunk = await asyncio.to_thread(state.audio_queue.get)
+        if chunk is None:
+            return
+
+        sat = state.satellite
+        if sat is None:
+            continue
+
+        # handle_audio() will no-op if streaming isn't active anymore
+        sat.handle_audio(chunk)
 
 
 async def main() -> None:
@@ -247,6 +268,8 @@ async def main() -> None:
         name=args.name,
         mac_address=get_mac(),
         audio_queue=Queue(),
+        # Small bounded queue prevents unbounded memory growth if HA/network stalls.
+        audio_queue=Queue(maxsize=8),
         entities=[],
         available_wake_words=available_wake_words,
         wake_words=wake_models,
@@ -280,6 +303,9 @@ async def main() -> None:
         lambda: VoiceSatelliteProtocol(state), host=args.host, port=args.port
     )
 
+    # Single asyncio task that sends queued audio to HA
+    audio_task = asyncio.create_task(audio_sender(state))
+
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=args.name)
     await discovery.register_server()
@@ -293,6 +319,10 @@ async def main() -> None:
     finally:
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
+        try:
+            await audio_task
+        except Exception:
+            _LOGGER.exception("Audio sender task crashed")
 
     _LOGGER.debug("Server stopped")
 
@@ -342,6 +372,12 @@ def process_audio(state: ServerState, mic, block_size: int):
                 if state.muted:
                     continue
 
+                # If HA pipeline is actively listening/streaming:
+                # - enqueue audio (already handled below)
+                # - DO NOT run wake word models (wasteful and can add load/jitter)
+                # - optionally run stop-word detection (only if enabled)
+                streaming = getattr(sat, "is_streaming_audio", False)
+
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
                     # Update list of wake word models to process
                     state.wake_words_changed = False
@@ -364,6 +400,43 @@ def process_audio(state: ServerState, mic, block_size: int):
                     # This avoids unnecessary network I/O and reduces CPU load.
                     if getattr(sat, "is_streaming_audio", False):
                         sat.handle_audio(audio_chunk)
+
+                    # Enqueue audio for HA while streaming is active.
+                    # Sending happens in the asyncio thread via `audio_sender()`.
+                    if getattr(sat, "is_streaming_audio", False):
+                        try:
+                            state.audio_queue.put_nowait(audio_chunk)
+                        except Full:
+                            # Drop oldest chunk to keep latency low rather than blocking.
+                            try:
+                                state.audio_queue.get_nowait()
+                            except Empty:
+                                pass
+                            try:
+                                state.audio_queue.put_nowait(audio_chunk)
+                            except Full:
+                                pass
+
+                        # Stop word detection: only when stop word is enabled/active.
+                        should_check_stop = (
+                            (not state.muted)
+                            and (state.stop_word.id in state.active_wake_words)
+                        )
+                        if should_check_stop:
+                            # Ensure features are available
+                            if micro_features is None:
+                                micro_features = MicroWakeWordFeatures()
+
+                            micro_inputs.clear()
+                            micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+
+                            for micro_input in micro_inputs:
+                                if state.stop_word.process_streaming(micro_input):
+                                    sat.stop()
+                                    break
+
+                        # Important: do NOT run wake word detection while streaming
+                        continue
 
                     assert micro_features is not None
                     micro_inputs.clear()
@@ -395,6 +468,8 @@ def process_audio(state: ServerState, mic, block_size: int):
                             ):
                                 sat.wakeup(wake_word)
                                 last_active = now
+                                # Once triggered, don't keep evaluating other wake words this block
+                                break
 
                     # Stop word detection: only when stop word is enabled/active.
                     should_check_stop = (
