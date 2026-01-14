@@ -180,6 +180,11 @@ class VoiceSatelliteProtocol(APIServer):
         """True while HA pipeline run is active (RUN_START..RUN_END/ERROR)."""
         return self._pipeline_active
 
+    @property
+    def block_wake_words(self) -> bool:
+        """Block wake word detection while a pipeline run is ongoing OR while local TTS is playing."""
+        return self._block_wake_words
+
     def _set_muted(self, new_state: bool) -> None:
         self.state.muted = bool(new_state)
 
@@ -209,6 +214,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._thinking_played = False
             self._pipeline_active = True
             self._is_streaming_audio = True
+            self._block_wake_words = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
             # HA reports it started STT.
@@ -253,6 +259,7 @@ class VoiceSatelliteProtocol(APIServer):
             msg = data.get("message", "") or ""
             self._pipeline_active = False
             self._is_streaming_audio = False
+            self._block_wake_words = False
             self._handle_pipeline_error(code, msg)
 
         # else: ignore unhandled events (but keep DEBUG logs)
@@ -455,6 +462,7 @@ class VoiceSatelliteProtocol(APIServer):
         )
         self.duck()
         self._pipeline_active = True
+        self._block_wake_words = True
         self._is_streaming_audio = True
 
         # Play wakeup beep without delaying microphone streaming.
@@ -513,9 +521,12 @@ class VoiceSatelliteProtocol(APIServer):
 
         if self._continue_conversation:
             self.send_messages([VoiceAssistantRequest(start=True)])
+            self._pipeline_active = True
+            self._block_wake_words = True
             self._is_streaming_audio = True
             _LOGGER.debug("Continuing conversation")
         else:
+            self._block_wake_words = False
             self.unduck()
 
         _LOGGER.debug("TTS response finished")
@@ -538,6 +549,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._disconnect_event.set()
         self._pipeline_active = False
         self._is_streaming_audio = False
+        self._block_wake_words = False
         self._tts_url = None
         self._tts_played = False
         self._continue_conversation = False

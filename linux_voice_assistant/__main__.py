@@ -382,6 +382,7 @@ def process_audio(state: ServerState, mic, block_size: int):
             while True:
                 audio_chunk_array = mic_in.record(block_size).reshape(-1)
                 audio_chunk_array = np.nan_to_num(audio_chunk_array, nan=0.0, posinf=0.0, neginf=0.0)
+                audio_chunk_array = np.clip(audio_chunk_array, -1.0, 1.0)
                 audio_chunk = (
                     (audio_chunk_array * 32767.0)
                     .astype("<i2")  # little-endian 16-bit signed
@@ -403,6 +404,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                 # - optionally run stop-word detection (only if enabled)
                 streaming = getattr(sat, "is_streaming_audio", False)
                 pipeline_active = getattr(sat, "pipeline_active", False)
+                block_wake_words = getattr(sat, "block_wake_words", False) or pipeline_active or streaming
 
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
                     # Update list of wake word models to process
@@ -424,7 +426,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                 try:
                     # Always suppress wakeword detection while a pipeline run is active.
                     # Otherwise device audio / echo can retrigger wake words mid-run.
-                    if pipeline_active or streaming:
+                    if block_wake_words:
                         # Send mic audio only while HA is actively streaming/listening
                         if streaming:
                             enqueue_audio(state, audio_chunk)
