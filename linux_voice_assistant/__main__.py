@@ -337,7 +337,7 @@ def _send_audio_batch(state: ServerState, batch: list[bytes]) -> None:
     sat.send_messages([VoiceAssistantAudio(data=b) for b in batch])
 
 
-def audio_sender_thread(state: ServerState, loop: asyncio.AbstractEventLoop, batch_size: int = 8) -> None:
+def audio_sender_thread(state: ServerState, loop: asyncio.AbstractEventLoop, batch_size: int = 4) -> None:
     """Blocking sender thread: batches audio and schedules 1 callback per batch."""
     while True:
         chunk = state.audio_queue.get()
@@ -424,13 +424,13 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
                 try:
+                    # Send mic audio only while HA is actively streaming/listening
+                    if streaming:
+                        enqueue_audio(state, audio_chunk)
+
                     # Always suppress wakeword detection while a pipeline run is active.
                     # Otherwise device audio / echo can retrigger wake words mid-run.
                     if block_wake_words:
-                        # Send mic audio only while HA is actively streaming/listening
-                        if streaming:
-                            enqueue_audio(state, audio_chunk)
-
                         # Still allow stop-word detection during the whole run (STT, intent, TTS),
                         # so user can interrupt TTS or cancel.
                         should_check_stop = (

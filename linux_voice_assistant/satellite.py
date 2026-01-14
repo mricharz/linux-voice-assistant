@@ -451,6 +451,10 @@ class VoiceSatelliteProtocol(APIServer):
             # Don't respond to wake words when muted (voice_assistant.stop behavior)
             return
 
+        self._pipeline_active = True
+        self._block_wake_words = True
+        self._is_streaming_audio = True
+
         wake_word_phrase = wake_word.wake_word
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
 
@@ -461,9 +465,6 @@ class VoiceSatelliteProtocol(APIServer):
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
         )
         self.duck()
-        self._pipeline_active = True
-        self._block_wake_words = True
-        self._is_streaming_audio = True
 
         # Play wakeup beep without delaying microphone streaming.
         try:
