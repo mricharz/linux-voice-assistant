@@ -267,7 +267,6 @@ async def main() -> None:
     state = ServerState(
         name=args.name,
         mac_address=get_mac(),
-        audio_queue=Queue(),
         # Small bounded queue prevents unbounded memory growth if HA/network stalls.
         audio_queue=Queue(maxsize=8),
         entities=[],
