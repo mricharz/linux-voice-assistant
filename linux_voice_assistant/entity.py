@@ -30,13 +30,13 @@ from .util import call_all
 
 
 SUPPORTED_MEDIA_PLAYER_FEATURES = (
-    MediaPlayerEntityFeature.PLAY
-    | MediaPlayerEntityFeature.PAUSE
-    | MediaPlayerEntityFeature.STOP
-    | MediaPlayerEntityFeature.PLAY_MEDIA
-    | MediaPlayerEntityFeature.VOLUME_SET
-    | MediaPlayerEntityFeature.VOLUME_MUTE
-    | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
+        MediaPlayerEntityFeature.PLAY
+        | MediaPlayerEntityFeature.PAUSE
+        | MediaPlayerEntityFeature.STOP
+        | MediaPlayerEntityFeature.PLAY_MEDIA
+        | MediaPlayerEntityFeature.VOLUME_SET
+        | MediaPlayerEntityFeature.VOLUME_MUTE
+        | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
 )
 
 
@@ -54,13 +54,13 @@ class ESPHomeEntity:
 
 class MediaPlayerEntity(ESPHomeEntity):
     def __init__(
-        self,
-        server: APIServer,
-        key: int,
-        name: str,
-        object_id: str,
-        music_player: MpvMediaPlayer,
-        announce_player: MpvMediaPlayer,
+            self,
+            server: APIServer,
+            key: int,
+            name: str,
+            object_id: str,
+            music_player: MpvMediaPlayer,
+            announce_player: MpvMediaPlayer,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -75,10 +75,10 @@ class MediaPlayerEntity(ESPHomeEntity):
         self.announce_player = announce_player
 
     def play(
-        self,
-        url: Union[str, List[str]],
-        announcement: bool = False,
-        done_callback: Optional[Callable[[], None]] = None,
+            self,
+            url: Union[str, List[str]],
+            announcement: bool = False,
+            done_callback: Optional[Callable[[], None]] = None,
     ) -> Iterable[message.Message]:
         previous_state = self._determine_state()
 
@@ -120,10 +120,12 @@ class MediaPlayerEntity(ESPHomeEntity):
                 )
         else:
             # Music
+            # The previous implementation executed `send_messages(...)` immediately
+            # because it passed the *result* into call_all. We must pass a callable.
             self.music_player.play(
                 url,
                 done_callback=lambda: call_all(
-                    self.server.send_messages(
+                    lambda: self.server.send_messages(
                         [self._update_state(MediaPlayerState.IDLE)]
                     ),
                     done_callback,
@@ -210,13 +212,13 @@ class MediaPlayerEntity(ESPHomeEntity):
 
 class MuteSwitchEntity(ESPHomeEntity):
     def __init__(
-        self,
-        server: APIServer,
-        key: int,
-        name: str,
-        object_id: str,
-        get_muted: Callable[[], bool],
-        set_muted: Callable[[bool], None],
+            self,
+            server: APIServer,
+            key: int,
+            name: str,
+            object_id: str,
+            get_muted: Callable[[], bool],
+            set_muted: Callable[[bool], None],
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -257,16 +259,16 @@ class MuteSwitchEntity(ESPHomeEntity):
 
 class NumberEntity(ESPHomeEntity):
     def __init__(
-        self,
-        server: APIServer,
-        key: int,
-        name: str,
-        object_id: str,
-        get_value: Callable[[], float],
-        set_value: Callable[[float], None],
-        min_value: float,
-        max_value: float,
-        step: float,
+            self,
+            server: APIServer,
+            key: int,
+            name: str,
+            object_id: str,
+            get_value: Callable[[], float],
+            set_value: Callable[[float], None],
+            min_value: float,
+            max_value: float,
+            step: float,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
         self.key = key

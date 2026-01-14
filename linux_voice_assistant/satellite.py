@@ -1,4 +1,23 @@
-"""Voice satellite protocol."""
+"""Voice satellite protocol.
+
+This module implements an ESPHome Native API server that behaves like a
+"voice satellite" device for Home Assistant Assist pipelines.
+
+Key behaviors:
+- Streams microphone audio to HA only while a pipeline is actively listening.
+- Plays local wakeup / thinking / timer sounds via mpv.
+- Tracks pipeline events (VAD start/end, TTS start/end, errors).
+- Provides entities (media player, mute switch, wakeword threshold).
+
+Notes on error handling:
+Home Assistant/ESPHome will emit a VOICE_ASSISTANT_ERROR event with
+data args 'code' and 'message'. We treat that as an end-of-run, clean up
+local playback/streaming state, unduck, and optionally run an error command.
+
+Reference (ESPHome voice_assistant.cpp):
+- VOICE_ASSISTANT_ERROR event type
+- args: code/message
+"""
 
 import asyncio
 import logging
@@ -50,6 +69,7 @@ from .util import call_all, run_command
 _LOGGER = logging.getLogger(__name__)
 
 PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
+
 
 class VoiceSatelliteProtocol(APIServer):
 
@@ -125,7 +145,11 @@ class VoiceSatelliteProtocol(APIServer):
                 name="Wakeword Threshold",
                 object_id="wakeword_threshold",
                 get_value=lambda: self.state.wakeword_threshold,
-                set_value=lambda v: setattr(self.state, "wakeword_threshold", max(0.0, min(1.0, float(v)))),
+                set_value=lambda v: setattr(
+                    self.state,
+                    "wakeword_threshold",
+                    max(0.0, min(1.0, float(v))),
+                ),
                 min_value=0.0,
                 max_value=1.0,
                 step=0.01,
@@ -135,6 +159,7 @@ class VoiceSatelliteProtocol(APIServer):
         elif threshold not in self.state.entities:
             self.state.entities.append(threshold)
 
+        # Streaming / pipeline state
         self._is_streaming_audio = False
         self._tts_url: Optional[str] = None
         self._tts_played = False
@@ -161,49 +186,107 @@ class VoiceSatelliteProtocol(APIServer):
             pass
 
     def handle_voice_event(
-        self, event_type: VoiceAssistantEventType, data: Dict[str, str]
+            self, event_type: VoiceAssistantEventType, data: Dict[str, str]
     ) -> None:
         _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
+            # A pipeline run started (wake word or manual start).
             self._tts_url = data.get("url")
             self._tts_played = False
             self._continue_conversation = False
             self._thinking_played = False
             run_command(self.state.synthesize_command)
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
+            # HA reports it started STT due to VAD.
             run_command(self.state.wake_command)
+
         elif event_type in (
-            VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
-            VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
+                VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
+                VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
+            # Stop streaming mic once user stopped speaking / STT finished.
             self._is_streaming_audio = False
             run_command(self.state.sst_stop_command)
             self._play_thinking_sound()
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
+            # Assist pipeline can request "start streaming TTS early"
             if data.get("tts_start_streaming") == "1":
-                # Start streaming early
                 self.play_tts()
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
             if data.get("continue_conversation") == "1":
                 self._continue_conversation = True
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_END:
+            # Final TTS URL is available now.
             self._tts_url = data.get("url")
             self.play_tts()
             run_command(self.state.tts_played_command)
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
+            # End of pipeline run.
             self._is_streaming_audio = False
             if not self._tts_played:
                 self._tts_finished()
-
             self._tts_played = False
 
-        # TODO: handle error
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
+            # Error event: data usually includes 'code' and 'message'
+            # See ESPHome voice_assistant.cpp handling. :contentReference[oaicite:2]{index=2}
+            code = data.get("code", "") or ""
+            msg = data.get("message", "") or ""
+            self._handle_pipeline_error(code, msg)
+
+        # else: ignore unhandled events (but keep DEBUG logs)
+
+    def _handle_pipeline_error(self, code: str, msg: str) -> None:
+        """Handle pipeline errors and make sure local state is consistent.
+
+        We treat this as a "hard end" of a run:
+        - stop mic streaming
+        - stop local playback (wakeup/thinking/tts) to avoid getting stuck
+        - clear stop-word active state
+        - unduck music
+        - run optional error command with env vars for code/message
+        """
+        _LOGGER.error("Voice pipeline error: %s - %s", code, msg)
+
+        self._is_streaming_audio = False
+        self._continue_conversation = False
+        self._tts_played = False
+        self._thinking_played = False
+
+        # Stop local sounds to avoid "stuck thinking beep" etc.
+        try:
+            self.state.tts_player.stop()
+        except Exception:
+            _LOGGER.exception("Failed to stop TTS player during error cleanup")
+
+        # Make sure stop-word isn't left active forever.
+        self.state.active_wake_words.discard(self.state.stop_word.id)
+
+        # Restore media ducking state.
+        try:
+            self.unduck()
+        except Exception:
+            _LOGGER.exception("Failed to unduck during error cleanup")
+
+        # Optionally notify external scripts
+        run_command(
+            self.state.error_command,
+            env={
+                "LVA_ERROR_CODE": code,
+                "LVA_ERROR_MESSAGE": msg,
+            },
+        )
 
     def handle_timer_event(
-        self,
-        event_type: VoiceAssistantTimerEventType,
-        msg: VoiceAssistantTimerEventResponse,
+            self,
+            event_type: VoiceAssistantTimerEventType,
+            msg: VoiceAssistantTimerEventResponse,
     ) -> None:
         _LOGGER.debug("Timer event: type=%s", event_type.name)
         if event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_FINISHED:
@@ -221,6 +304,7 @@ class VoiceSatelliteProtocol(APIServer):
                 data[arg.name] = arg.value
 
             self.handle_voice_event(VoiceAssistantEventType(msg.event_type), data)
+
         elif isinstance(msg, VoiceAssistantAnnounceRequest):
             _LOGGER.debug("Announcing: %s", msg.text)
 
@@ -239,11 +323,13 @@ class VoiceSatelliteProtocol(APIServer):
             yield from self.state.media_player_entity.play(
                 urls, announcement=True, done_callback=self._tts_finished
             )
+
         elif isinstance(msg, VoiceAssistantTimerEventResponse):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
+
         elif isinstance(msg, DeviceInfoRequest):
             # Compute dynamic device name
-            base_name = re.sub(r'[\s-]+', '-', self.state.name.lower()).strip('-')
+            base_name = re.sub(r"[\s-]+", "-", self.state.name.lower()).strip("-")
             mac_no_colon = self.state.mac_address.replace(":", "").lower()
             mac_last6 = mac_no_colon[-6:]
             device_name = f"{base_name}-{mac_last6}"
@@ -255,28 +341,30 @@ class VoiceSatelliteProtocol(APIServer):
                 manufacturer="Open Home Foundation",
                 model="Linux Voice Assistant",
                 voice_assistant_feature_flags=(
-                    VoiceAssistantFeature.VOICE_ASSISTANT
-                    | VoiceAssistantFeature.API_AUDIO
-                    | VoiceAssistantFeature.ANNOUNCE
-                    | VoiceAssistantFeature.START_CONVERSATION
-                    | VoiceAssistantFeature.TIMERS
+                        VoiceAssistantFeature.VOICE_ASSISTANT
+                        | VoiceAssistantFeature.API_AUDIO
+                        | VoiceAssistantFeature.ANNOUNCE
+                        | VoiceAssistantFeature.START_CONVERSATION
+                        | VoiceAssistantFeature.TIMERS
                 ),
             )
+
         elif isinstance(
-            msg,
-            (
-                ListEntitiesRequest,
-                SubscribeHomeAssistantStatesRequest,
-                MediaPlayerCommandRequest,
-                SwitchCommandRequest,
-                NumberCommandRequest,
-            ),
+                msg,
+                (
+                        ListEntitiesRequest,
+                        SubscribeHomeAssistantStatesRequest,
+                        MediaPlayerCommandRequest,
+                        SwitchCommandRequest,
+                        NumberCommandRequest,
+                ),
         ):
             for entity in self.state.entities:
                 yield from entity.handle_message(msg)
 
             if isinstance(msg, ListEntitiesRequest):
                 yield ListEntitiesDoneResponse()
+
         elif isinstance(msg, VoiceAssistantConfigurationRequest):
             yield VoiceAssistantConfigurationResponse(
                 available_wake_words=[
@@ -295,6 +383,7 @@ class VoiceSatelliteProtocol(APIServer):
                 max_active_wake_words=2,
             )
             _LOGGER.info("Connected to Home Assistant")
+
         elif isinstance(msg, VoiceAssistantSetConfiguration):
             # Change active wake words
             active_wake_words: Set[str] = set()
@@ -324,10 +413,8 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.wake_words_changed = True
 
     def handle_audio(self, audio_chunk: bytes) -> None:
-
         if not self._is_streaming_audio or self.state.muted:
             return
-
         self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
 
     def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord]) -> None:
@@ -344,12 +431,21 @@ class VoiceSatelliteProtocol(APIServer):
 
         wake_word_phrase = wake_word.wake_word
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
+
+        # Start pipeline AND start streaming immediately.
+        # (Previous optional optimization "don't stream during beep" removed,
+        # because you explicitly want immediate listening and you have AEC enabled.)
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
         )
         self.duck()
         self._is_streaming_audio = True
-        self.state.tts_player.play(self.state.wakeup_sound)
+
+        # Play wakeup beep without delaying microphone streaming.
+        try:
+            self.state.tts_player.play(self.state.wakeup_sound)
+        except Exception:
+            _LOGGER.exception("Failed to play wakeup sound")
 
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
@@ -429,6 +525,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
+        self._thinking_played = False
 
         # Stop any ongoing audio playback and wake/stop word processing.
         try:
@@ -459,6 +556,8 @@ class VoiceSatelliteProtocol(APIServer):
             # Send states after connect
             states = []
             for entity in self.state.entities:
-                states.extend(entity.handle_message(SubscribeHomeAssistantStatesRequest()))
+                states.extend(
+                    entity.handle_message(SubscribeHomeAssistantStatesRequest())
+                )
             self.send_messages(states)
             _LOGGER.debug("Sent entity states after connect")

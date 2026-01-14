@@ -301,7 +301,16 @@ async def main() -> None:
 
 
 def process_audio(state: ServerState, mic, block_size: int):
-    """Process audio chunks from the microphone."""
+    """Process audio chunks from the microphone.
+
+    - This function runs in a *dedicated OS thread*.
+    - It must NOT call asyncio transport methods directly.
+      All network I/O is delegated to VoiceSatelliteProtocol via thread-safe scheduling
+      (see satellite.py).
+    - To reduce CPU usage on small devices:
+        * Only send audio to Home Assistant when streaming is active.
+        * Only evaluate the stop-word model when it is enabled/active.
+    """
 
     wake_words: List[Union[MicroWakeWord, OpenWakeWord]] = []
     micro_features: Optional[MicroWakeWordFeatures] = None
@@ -324,7 +333,13 @@ def process_audio(state: ServerState, mic, block_size: int):
                     .tobytes()
                 )
 
-                if state.satellite is None:
+                sat = state.satellite
+                if sat is None:
+                    continue
+
+                # If muted, skip heavy work (wakeword + features) to save CPU.
+                # We still keep the recorder running.
+                if state.muted:
                     continue
 
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
@@ -336,10 +351,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                         if ww.id in state.active_wake_words
                     ]
 
-                    has_oww = False
-                    for wake_word in wake_words:
-                        if isinstance(wake_word, OpenWakeWord):
-                            has_oww = True
+                    has_oww = any(isinstance(ww, OpenWakeWord) for ww in wake_words)
 
                     if micro_features is None:
                         micro_features = MicroWakeWordFeatures()
@@ -348,7 +360,10 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
                 try:
-                    state.satellite.handle_audio(audio_chunk)
+                    # Only send audio to HA while the pipeline is actively listening/streaming.
+                    # This avoids unnecessary network I/O and reduces CPU load.
+                    if getattr(sat, "is_streaming_audio", False):
+                        sat.handle_audio(audio_chunk)
 
                     assert micro_features is not None
                     micro_inputs.clear()
@@ -359,6 +374,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_inputs.clear()
                         oww_inputs.extend(oww_features.process_streaming(audio_chunk))
 
+                    # Wake word detection
                     for wake_word in wake_words:
                         activated = False
                         if isinstance(wake_word, MicroWakeWord):
@@ -375,19 +391,26 @@ def process_audio(state: ServerState, mic, block_size: int):
                             # Check refractory
                             now = time.monotonic()
                             if (last_active is None) or (
-                                (now - last_active) > state.refractory_seconds
+                                    (now - last_active) > state.refractory_seconds
                             ):
-                                state.satellite.wakeup(wake_word)
+                                sat.wakeup(wake_word)
                                 last_active = now
 
-                    # Always process to keep state correct
-                    stopped = False
-                    for micro_input in micro_inputs:
-                        if state.stop_word.process_streaming(micro_input):
-                            stopped = True
+                    # Stop word detection: only when stop word is enabled/active.
+                    should_check_stop = (
+                            (not state.muted)
+                            and (state.stop_word.id in state.active_wake_words)
+                    )
+                    if should_check_stop:
+                        stopped = False
+                        for micro_input in micro_inputs:
+                            if state.stop_word.process_streaming(micro_input):
+                                stopped = True
+                                break
 
-                    if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                        state.satellite.stop()
+                        if stopped:
+                            sat.stop()
+
                 except Exception:
                     _LOGGER.exception("Unexpected error handling audio")
     except Exception:
