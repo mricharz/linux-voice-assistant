@@ -203,8 +203,8 @@ class VoiceSatelliteProtocol(APIServer):
             self._thinking_played = False
             self._is_streaming_audio = True
 
-        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
-            # HA reports it started STT due to VAD.
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
+            # HA reports it started STT.
             run_command(self.state.wake_command)
 
         elif event_type in (
