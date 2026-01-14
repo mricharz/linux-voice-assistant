@@ -526,10 +526,15 @@ class VoiceSatelliteProtocol(APIServer):
             self._is_streaming_audio = True
             _LOGGER.debug("Continuing conversation")
         else:
-            self._block_wake_words = False
+            self._block_wake_words = True
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.5, self._release_wakeword_block)
             self.unduck()
 
         _LOGGER.debug("TTS response finished")
+
+    def _release_wakeword_block(self) -> None:
+        self._block_wake_words = False
 
     def _play_timer_finished(self) -> None:
         if not self._timer_finished:
