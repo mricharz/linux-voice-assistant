@@ -169,6 +169,11 @@ class VoiceSatelliteProtocol(APIServer):
 
         self._disconnect_event = asyncio.Event()
 
+    @property
+    def is_streaming_audio(self) -> bool:
+        """True when microphone audio should be streamed to Home Assistant."""
+        return self._is_streaming_audio and (not self.state.muted)
+
     def _set_muted(self, new_state: bool) -> None:
         self.state.muted = bool(new_state)
 
@@ -196,7 +201,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._thinking_played = False
-            run_command(self.state.synthesize_command)
+            self._is_streaming_audio = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
             # HA reports it started STT due to VAD.
