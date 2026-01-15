@@ -295,6 +295,8 @@ class VoiceSatelliteProtocol(APIServer):
                 return
             self._speech_end_handled = True
 
+            if data.get("source") == "local":
+                self._send_end_of_stream_to_ha()
             self._is_streaming_audio = False
             run_command(self.state.sst_stop_command)
             self._play_thinking_sound()
@@ -337,6 +339,24 @@ class VoiceSatelliteProtocol(APIServer):
         # else: ignore unhandled events (keep DEBUG logs)
 
     # -------------------------------------------------------------------------
+
+    def _send_end_of_stream_to_ha(self) -> None:
+        try:
+            msg = VoiceAssistantAudio()
+            # depending on proto version:
+            if hasattr(msg, "end") :
+                msg.end = True
+            elif hasattr(msg, "end_of_stream"):
+                msg.end_of_stream = True
+            elif hasattr(msg, "last"):
+                msg.last = True
+            else:
+                # fallback: send empty chunk (less reliable)
+                msg.data = b""
+
+            self.send_messages([msg])
+        except Exception:
+            _LOGGER.exception("Failed to send end-of-stream marker to HA")
 
     def _handle_pipeline_error(self, code: str, msg: str) -> None:
         _LOGGER.error("Voice pipeline error: %s - %s", code, msg)
