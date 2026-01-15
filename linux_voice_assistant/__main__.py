@@ -386,7 +386,7 @@ async def main() -> None:
     parser.add_argument(
         "--local-vad-start-delay-ms",
         type=int,
-        default=0,
+        default=200,
         help="Ignore VAD for first N ms after wake (helps filter wake beep echo). [experimental]",
     )
 
