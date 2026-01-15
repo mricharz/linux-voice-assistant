@@ -203,6 +203,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.entities.append(va_mode_entity)
 
         self.state.va_mode_entity.server = self
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -------------------------------------------------------------------------
 
@@ -607,8 +608,16 @@ class VoiceSatelliteProtocol(APIServer):
             _LOGGER.debug("Continuing conversation")
         else:
             self._block_wake_words = True
-            loop = asyncio.get_running_loop()
-            loop.call_later(0.5, self._release_wakeword_block)
+            loop = self._loop
+            if loop is not None:
+                # call_later is not thread-safe, so schedule a thread-safe wrapper first.
+                def _schedule_release() -> None:
+                    loop.call_later(0.5, self._release_wakeword_block)
+
+                loop.call_soon_threadsafe(_schedule_release)
+            else:
+                # Fallback: release immediately if we have no loop (should be rare)
+                self._release_wakeword_block()
             self.unduck()
 
         _LOGGER.debug("TTS response finished")
@@ -629,6 +638,14 @@ class VoiceSatelliteProtocol(APIServer):
         )
 
     # -------------------------------------------------------------------------
+
+    def connection_made(self, transport) -> None:
+        super().connection_made(transport)
+        # Capture the asyncio loop that owns this protocol.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     def connection_lost(self, exc):
         super().connection_lost(exc)
