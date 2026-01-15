@@ -8,6 +8,7 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ListEntitiesRequest,
     ListEntitiesSwitchResponse,
     ListEntitiesNumberResponse,
+    ListEntitiesSelectResponse,
     MediaPlayerCommandRequest,
     MediaPlayerStateResponse,
     SubscribeHomeAssistantStatesRequest,
@@ -15,8 +16,6 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     SwitchStateResponse,
     NumberCommandRequest,
     NumberStateResponse,
-    # Select (dropdown)
-    ListEntitiesSelectResponse,
     SelectCommandRequest,
     SelectStateResponse,
 )
@@ -174,6 +173,7 @@ class MediaPlayerEntity(ESPHomeEntity):
                 self.announce_player.set_volume(volume)
                 self.volume = msg.volume
                 yield self._update_state(self.state)
+
         elif isinstance(msg, ListEntitiesRequest):
             yield ListEntitiesMediaPlayerResponse(
                 object_id=self.object_id,
@@ -182,6 +182,7 @@ class MediaPlayerEntity(ESPHomeEntity):
                 supports_pause=True,
                 feature_flags=SUPPORTED_MEDIA_PLAYER_FEATURES,
             )
+
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
             yield self._get_state_message()
 
@@ -200,10 +201,8 @@ class MediaPlayerEntity(ESPHomeEntity):
     def _determine_state(self) -> MediaPlayerState:
         if self.music_player.is_playing or self.announce_player.is_playing:
             return MediaPlayerState.PLAYING
-
         if self.music_player.is_paused or self.announce_player.is_paused:
             return MediaPlayerState.PAUSED
-
         return MediaPlayerState.IDLE
 
 
@@ -244,6 +243,7 @@ class MuteSwitchEntity(ESPHomeEntity):
             self._switch_state = new_state
             self._set_muted(new_state)
             yield SwitchStateResponse(key=self.key, state=self._switch_state)
+
         elif isinstance(msg, ListEntitiesRequest):
             yield ListEntitiesSwitchResponse(
                 object_id=self.object_id,
@@ -252,6 +252,7 @@ class MuteSwitchEntity(ESPHomeEntity):
                 entity_category=EntityCategory.CONFIG,
                 icon="mdi:microphone-off",
             )
+
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
             self.sync_with_state()
             yield SwitchStateResponse(key=self.key, state=self._switch_state)
@@ -290,6 +291,7 @@ class NumberEntity(ESPHomeEntity):
         if isinstance(msg, NumberCommandRequest) and (msg.key == self.key):
             self._set_value(float(msg.state))
             yield NumberStateResponse(key=self.key, state=self._get_value())
+
         elif isinstance(msg, ListEntitiesRequest):
             yield ListEntitiesNumberResponse(
                 object_id=self.object_id,
@@ -301,6 +303,7 @@ class NumberEntity(ESPHomeEntity):
                 entity_category=EntityCategory.CONFIG,
                 icon="mdi:tune-vertical",
             )
+
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
             yield NumberStateResponse(key=self.key, state=self._get_value())
 
@@ -309,11 +312,10 @@ class NumberEntity(ESPHomeEntity):
 
 
 class SelectEntity(ESPHomeEntity):
-    """Simple dropdown (select) entity for ESPHome Native API.
+    """ESPHome Select entity (dropdown in Home Assistant).
 
-    Used here to switch VAD mode in Home Assistant UI:
-      - "ha"    -> use HA pipeline VAD events
-      - "local" -> local WebRTC VAD to end speech earlier
+    This is what you want for 'ha/local' mode switching. Anything else will
+    show up as a sensor-ish status display and make humans sad.
     """
 
     def __init__(
@@ -326,6 +328,7 @@ class SelectEntity(ESPHomeEntity):
             get_value: Callable[[], str],
             set_value: Callable[[str], None],
             icon: str = "mdi:format-list-bulleted",
+            entity_category: EntityCategory = EntityCategory.CONFIG,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
         self.key = key
@@ -335,12 +338,18 @@ class SelectEntity(ESPHomeEntity):
         self._get_value = get_value
         self._set_value = set_value
         self.icon = icon
+        self.entity_category = entity_category
+
+    def update_callbacks(
+            self, get_value: Callable[[], str], set_value: Callable[[str], None]
+    ) -> None:
+        self._get_value = get_value
+        self._set_value = set_value
 
     def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
         if isinstance(msg, SelectCommandRequest) and (msg.key == self.key):
-            new_state = str(msg.state)
-            if new_state in self.options:
-                self._set_value(new_state)
+            new_value = str(msg.state)
+            self._set_value(new_value)
             yield SelectStateResponse(key=self.key, state=self._get_value())
 
         elif isinstance(msg, ListEntitiesRequest):
@@ -349,8 +358,8 @@ class SelectEntity(ESPHomeEntity):
                 key=self.key,
                 name=self.name,
                 options=self.options,
-                entity_category=EntityCategory.CONFIG,
                 icon=self.icon,
+                entity_category=self.entity_category,
             )
 
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
