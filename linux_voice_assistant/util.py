@@ -10,6 +10,7 @@ import os
 
 _LOGGER = logging.getLogger(__name__)
 
+
 def get_mac() -> str:
     mac = uuid.getnode()
     mac_str = ":".join(f"{(mac >> i) & 0xff:02x}" for i in range(40, -1, -8))
@@ -20,7 +21,9 @@ def call_all(*callables: Optional[Callable[[], None]]) -> None:
     for item in filter(None, callables):
         item()
 
+
 def run_command(command: Optional[str], env: Optional[dict] = None) -> None:
+    """Run a shell-like command in a non-blocking way."""
     if not command:
         return
     _LOGGER.debug("Running %s", command)

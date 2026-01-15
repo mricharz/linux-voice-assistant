@@ -15,6 +15,10 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     SwitchStateResponse,
     NumberCommandRequest,
     NumberStateResponse,
+    # Select (dropdown)
+    ListEntitiesSelectResponse,
+    SelectCommandRequest,
+    SelectStateResponse,
 )
 from aioesphomeapi.model import (
     MediaPlayerCommand,
@@ -95,9 +99,7 @@ class MediaPlayerEntity(ESPHomeEntity):
                     self.announce_player.is_paused = True
 
             def restore_state() -> None:
-                self.server.send_messages(
-                    [self._update_state(previous_state)]
-                )
+                self.server.send_messages([self._update_state(previous_state)])
 
             if music_was_playing:
                 self.announce_player.play(
@@ -120,8 +122,6 @@ class MediaPlayerEntity(ESPHomeEntity):
                 )
         else:
             # Music
-            # The previous implementation executed `send_messages(...)` immediately
-            # because it passed the *result* into call_all. We must pass a callable.
             self.music_player.play(
                 url,
                 done_callback=lambda: call_all(
@@ -280,7 +280,9 @@ class NumberEntity(ESPHomeEntity):
         self.max_value = max_value
         self.step = step
 
-    def update_callbacks(self, get_value: Callable[[], float], set_value: Callable[[float], None]) -> None:
+    def update_callbacks(
+            self, get_value: Callable[[], float], set_value: Callable[[float], None]
+    ) -> None:
         self._get_value = get_value
         self._set_value = set_value
 
@@ -301,3 +303,55 @@ class NumberEntity(ESPHomeEntity):
             )
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
             yield NumberStateResponse(key=self.key, state=self._get_value())
+
+
+# -----------------------------------------------------------------------------
+
+
+class SelectEntity(ESPHomeEntity):
+    """Simple dropdown (select) entity for ESPHome Native API.
+
+    Used here to switch VAD mode in Home Assistant UI:
+      - "ha"    -> use HA pipeline VAD events
+      - "local" -> local WebRTC VAD to end speech earlier
+    """
+
+    def __init__(
+            self,
+            server: APIServer,
+            key: int,
+            name: str,
+            object_id: str,
+            options: List[str],
+            get_value: Callable[[], str],
+            set_value: Callable[[str], None],
+            icon: str = "mdi:format-list-bulleted",
+    ) -> None:
+        ESPHomeEntity.__init__(self, server)
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self.options = options
+        self._get_value = get_value
+        self._set_value = set_value
+        self.icon = icon
+
+    def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
+        if isinstance(msg, SelectCommandRequest) and (msg.key == self.key):
+            new_state = str(msg.state)
+            if new_state in self.options:
+                self._set_value(new_state)
+            yield SelectStateResponse(key=self.key, state=self._get_value())
+
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesSelectResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                options=self.options,
+                entity_category=EntityCategory.CONFIG,
+                icon=self.icon,
+            )
+
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            yield SelectStateResponse(key=self.key, state=self._get_value())

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from pymicro_wakeword import MicroWakeWord
     from pyopen_wakeword import OpenWakeWord
 
-    from .entity import ESPHomeEntity, MediaPlayerEntity, MuteSwitchEntity, NumberEntity
+    from .entity import ESPHomeEntity, MediaPlayerEntity, MuteSwitchEntity, NumberEntity, SelectEntity
     from .mpv_player import MpvMediaPlayer
     from .satellite import VoiceSatelliteProtocol
 
@@ -43,7 +43,6 @@ class AvailableWakeWord:
 
             oww_model = OpenWakeWord.from_model(model_path=self.wake_word_path)
             setattr(oww_model, "wake_word", self.wake_word)
-
             return oww_model
 
         raise ValueError(f"Unexpected wake word type: {self.type}")
@@ -52,6 +51,11 @@ class AvailableWakeWord:
 @dataclass
 class Preferences:
     active_wake_words: List[str] = field(default_factory=list)
+
+    # Voice activity detection mode:
+    # - "ha": rely on Home Assistant pipeline VAD events
+    # - "local": use local WebRTC VAD to cut mic earlier (faster, less waiting)
+    va_mode: str = "ha"
 
 
 @dataclass
@@ -72,17 +76,31 @@ class ServerState:
     preferences: Preferences
     preferences_path: Path
 
+    # Mode/config (runtime)
+    va_mode: str = "ha"
+
+    # Local VAD tuning (used when va_mode == "local")
+    local_vad_aggressiveness: int = 2  # 0..3
+    local_vad_frame_ms: int = 30       # 10/20/30
+    local_vad_min_speech_ms: int = 150
+    local_vad_min_silence_ms: int = 600
+    local_vad_start_delay_ms: int = 0  # optional "ignore first N ms" after wake
+
+    # Entities
     media_player_entity: "Optional[MediaPlayerEntity]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None
     threshold_entity: "Optional[NumberEntity]" = None
+    va_mode_entity: "Optional[SelectEntity]" = None
+
+    # Wakeword/runtime state
     wake_words_changed: bool = False
     refractory_seconds: float = 2.0
-    wake_command: str = None
-    sst_stop_command: str = None
-    synthesize_command: str = None
-    tts_played_command: str = None
-    error_command: str = None
+    wake_command: Optional[str] = None
+    sst_stop_command: Optional[str] = None
+    synthesize_command: Optional[str] = None
+    tts_played_command: Optional[str] = None
+    error_command: Optional[str] = None
     muted: bool = False
     connected: bool = False
     wakeword_threshold: float = 0.5

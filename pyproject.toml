@@ -32,6 +32,7 @@ dependencies = [
     "pyopen-wakeword>=1,<2",
     "python-mpv>=1,<2",
     "zeroconf<1",
+    "webrtcvad>=2.0.10,<3",
 ]
 
 [project.optional-dependencies]

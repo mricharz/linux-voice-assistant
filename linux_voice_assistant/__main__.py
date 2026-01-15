@@ -15,8 +15,10 @@ import soundcard as sc
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from aioesphomeapi.model import VoiceAssistantEventType
+
+from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
-from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .util import get_mac
 from .zeroconf import HomeAssistantZeroconf
@@ -29,10 +31,283 @@ _SOUNDS_DIR = _REPO_DIR / "sounds"
 
 
 # -----------------------------------------------------------------------------
+# Audio sending (asyncio loop thread) via a bounded queue + batching
+
+
+def enqueue_audio(state: ServerState, audio_chunk: bytes) -> None:
+    """Put audio into bounded queue, dropping oldest on overflow to keep latency low."""
+    try:
+        state.audio_queue.put_nowait(audio_chunk)
+    except Full:
+        try:
+            state.audio_queue.get_nowait()
+        except Empty:
+            pass
+        try:
+            state.audio_queue.put_nowait(audio_chunk)
+        except Full:
+            pass
+
+
+def _send_audio_batch(state: ServerState, batch: List[bytes]) -> None:
+    """Runs in asyncio thread (event loop)."""
+    sat = state.satellite
+    if sat is None:
+        return
+    if not getattr(sat, "is_streaming_audio", False):
+        return
+
+    from aioesphomeapi.api_pb2 import VoiceAssistantAudio  # local import
+    sat.send_messages([VoiceAssistantAudio(data=b) for b in batch])
+
+
+def audio_sender_thread(
+        state: ServerState,
+        loop: asyncio.AbstractEventLoop,
+        batch_size: int = 4,
+) -> None:
+    """Blocking sender thread: batches audio and schedules 1 callback per batch."""
+    while True:
+        chunk = state.audio_queue.get()
+        if chunk is None:
+            return
+
+        batch = [chunk]
+        for _ in range(batch_size - 1):
+            try:
+                batch.append(state.audio_queue.get_nowait())
+            except Empty:
+                break
+
+        loop.call_soon_threadsafe(_send_audio_batch, state, batch)
+
+
+# -----------------------------------------------------------------------------
+# Audio processing (mic thread)
+
+
+def _schedule_sat_event(
+        loop: asyncio.AbstractEventLoop,
+        state: ServerState,
+        event_type: VoiceAssistantEventType,
+        data: Optional[Dict[str, str]] = None,
+) -> None:
+    """Schedule a satellite event on the asyncio loop thread (thread-safe)."""
+    sat = state.satellite
+    if sat is None:
+        return
+    loop.call_soon_threadsafe(sat.handle_voice_event, event_type, data or {})
+
+
+def _schedule_sat_stop(loop: asyncio.AbstractEventLoop, state: ServerState) -> None:
+    sat = state.satellite
+    if sat is None:
+        return
+    loop.call_soon_threadsafe(sat.stop)
+
+
+def _schedule_sat_wakeup(loop: asyncio.AbstractEventLoop, state: ServerState, wake_word) -> None:
+    sat = state.satellite
+    if sat is None:
+        return
+    loop.call_soon_threadsafe(sat.wakeup, wake_word)
+
+
+def process_audio(
+        state: ServerState,
+        mic,
+        block_size: int,
+        loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Process audio chunks from the microphone.
+
+    Runs in a dedicated OS thread.
+
+    Responsibilities:
+    - Convert mic samples to s16le/16k/mono bytes.
+    - Enqueue audio for HA while sat.is_streaming_audio is True.
+    - Detect wake word while not blocked.
+    - Detect stop-word only when active.
+    - If va_mode == 'local': run WebRTC VAD during a run and emit VAD events to satellite.
+    """
+
+    wake_words: List[Union[MicroWakeWord, OpenWakeWord]] = []
+    micro_features: Optional[MicroWakeWordFeatures] = None
+    micro_inputs: List[np.ndarray] = []
+
+    oww_features: Optional[OpenWakeWordFeatures] = None
+    oww_inputs: List[np.ndarray] = []
+    has_oww = False
+
+    last_active: Optional[float] = None
+
+    # Local VAD (created lazily)
+    local_vad: Optional[LocalWebRTCVAD] = None
+    last_va_mode: Optional[str] = None
+    last_pipeline_active: bool = False
+
+    try:
+        _LOGGER.debug("Opening audio input device: %s", mic.name)
+        with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
+            while True:
+                audio_chunk_array = mic_in.record(block_size).reshape(-1)
+
+                # In-place sanitize (cheaper than allocating new arrays)
+                np.nan_to_num(audio_chunk_array, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                np.clip(audio_chunk_array, -1.0, 1.0, out=audio_chunk_array)
+
+                audio_chunk = (audio_chunk_array * 32767.0).astype("<i2").tobytes()
+
+                sat = state.satellite
+                if sat is None:
+                    continue
+
+                if state.muted:
+                    continue
+
+                streaming = getattr(sat, "is_streaming_audio", False)
+                pipeline_active = getattr(sat, "pipeline_active", False)
+                block_wake_words = getattr(sat, "block_wake_words", False) or streaming
+
+                # Always stream audio immediately when sat says so (important for HA VAD mode)
+                if streaming:
+                    enqueue_audio(state, audio_chunk)
+
+                # (Re)load wake models if changed
+                if (not wake_words) or (state.wake_words_changed and state.wake_words):
+                    state.wake_words_changed = False
+                    wake_words = [
+                        ww
+                        for ww in state.wake_words.values()
+                        if ww.id in state.active_wake_words
+                    ]
+                    has_oww = any(isinstance(ww, OpenWakeWord) for ww in wake_words)
+                    if micro_features is None:
+                        micro_features = MicroWakeWordFeatures()
+                    if has_oww and (oww_features is None):
+                        oww_features = OpenWakeWordFeatures.from_builtin()
+
+                # Local VAD setup/refresh on mode changes
+                va_mode = getattr(state, "va_mode", "ha") or "ha"
+                if va_mode != last_va_mode:
+                    last_va_mode = va_mode
+                    local_vad = None  # re-create lazily on demand
+
+                # Reset local VAD on new run
+                if pipeline_active and not last_pipeline_active:
+                    if local_vad is not None:
+                        local_vad.reset()
+                last_pipeline_active = pipeline_active
+
+                # -----------------------------------------------------------------
+                # Stop-word detection (only when enabled/active)
+                should_check_stop = (state.stop_word.id in state.active_wake_words)
+                if should_check_stop:
+                    if micro_features is None:
+                        micro_features = MicroWakeWordFeatures()
+
+                    micro_inputs.clear()
+                    micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+
+                    for micro_input in micro_inputs:
+                        if state.stop_word.process_streaming(micro_input):
+                            _schedule_sat_stop(loop, state)
+                            break
+
+                # -----------------------------------------------------------------
+                # Local VAD (only during a run, only in local mode, only while streaming)
+                if va_mode == "local" and pipeline_active and streaming:
+                    if local_vad is None:
+                        cfg = LocalVADConfig(
+                            sample_rate=16000,
+                            frame_ms=int(state.local_vad_frame_ms),
+                            aggressiveness=int(state.local_vad_aggressiveness),
+                            min_speech_ms=int(state.local_vad_min_speech_ms),
+                            min_silence_ms=int(state.local_vad_min_silence_ms),
+                            start_delay_ms=int(state.local_vad_start_delay_ms),
+                        )
+                        local_vad = LocalWebRTCVAD(cfg)
+
+                    # Optional start delay (avoid false VAD on wake beep / AEC settling)
+                    allow_vad = True
+                    run_started_at = getattr(sat, "run_started_at", None)
+                    if run_started_at is not None and local_vad.cfg.start_delay_ms > 0:
+                        allow_vad = (time.monotonic() - run_started_at) * 1000.0 >= local_vad.cfg.start_delay_ms
+
+                    for ev in local_vad.process(audio_chunk, allow_vad=allow_vad):
+                        if ev == "vad_start":
+                            _schedule_sat_event(
+                                loop,
+                                state,
+                                VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START,
+                                {"source": "local"},
+                            )
+                        elif ev == "vad_end":
+                            _schedule_sat_event(
+                                loop,
+                                state,
+                                VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
+                                {"source": "local"},
+                            )
+
+                    # While pipeline is active, we never run wake word detection
+                    # (prevents re-triggers from echo/TTS).
+                    continue
+
+                # -----------------------------------------------------------------
+                # While pipeline is active or wakewords are blocked, don't run wakewords
+                if pipeline_active or block_wake_words:
+                    continue
+
+                # -----------------------------------------------------------------
+                # Wake word detection (only when not blocked)
+                if micro_features is None:
+                    micro_features = MicroWakeWordFeatures()
+
+                micro_inputs.clear()
+                micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+
+                if has_oww:
+                    assert oww_features is not None
+                    oww_inputs.clear()
+                    oww_inputs.extend(oww_features.process_streaming(audio_chunk))
+
+                for wake_word in wake_words:
+                    activated = False
+
+                    if isinstance(wake_word, MicroWakeWord):
+                        for micro_input in micro_inputs:
+                            if wake_word.process_streaming(micro_input):
+                                activated = True
+                                break
+
+                    elif isinstance(wake_word, OpenWakeWord):
+                        for oww_input in oww_inputs:
+                            for prob in wake_word.process_streaming(oww_input):
+                                if prob > state.wakeword_threshold:
+                                    activated = True
+                                    break
+                            if activated:
+                                break
+
+                    if activated:
+                        now = time.monotonic()
+                        if (last_active is None) or ((now - last_active) > state.refractory_seconds):
+                            _schedule_sat_wakeup(loop, state, wake_word)
+                            last_active = now
+                        break
+
+    except Exception:
+        _LOGGER.exception("Unexpected error processing audio")
+        sys.exit(1)
+
+
+# -----------------------------------------------------------------------------
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name")
+
     parser.add_argument(
         "--audio-input-device",
         help="soundcard name for input device (see --list-input-devices)",
@@ -43,6 +318,7 @@ async def main() -> None:
         help="List audio input devices and exit",
     )
     parser.add_argument("--audio-input-block-size", type=int, default=1024)
+
     parser.add_argument(
         "--audio-output-device",
         help="mpv name for output device (see --list-output-devices)",
@@ -52,15 +328,14 @@ async def main() -> None:
         action="store_true",
         help="List audio output devices and exit",
     )
+
     parser.add_argument(
         "--wake-word-dir",
         default=[_WAKEWORDS_DIR],
         action="append",
         help="Directory with wake word models (.tflite) and configs (.json)",
     )
-    parser.add_argument(
-        "--wake-model", default="okay_nabu", help="Id of active wake model"
-    )
+    parser.add_argument("--wake-model", default="okay_nabu", help="Id of active wake model")
     parser.add_argument("--stop-model", default="stop", help="Id of stop model")
     parser.add_argument(
         "--refractory-seconds",
@@ -74,61 +349,75 @@ async def main() -> None:
         default=0.5,
         help="Probability threshold (0-1) for wake word activation",
     )
-    #
+
+    # VAD mode
     parser.add_argument(
-        "--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac")
-    )
-    parser.add_argument(
-        "--thinking-sound", default=str(_SOUNDS_DIR / "processing.wav"),
-        help="Short sound to play while assistant is processing (thinking)"
-    )
-    parser.add_argument(
-        "--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac")
-    )
-    parser.add_argument(
-        "--wake-command",
+        "--va-mode",
+        choices=("ha", "local"),
         default=None,
-        type=str,
-        help="Command to run when wake word was triggered",
+        help="Voice activity detection mode: 'ha' (default) or 'local' (webrtcvad). [experimental]",
     )
     parser.add_argument(
-        "--sst-stop-command",
-        default=None,
-        type=str,
-        help="Command to run when the user stops speaking",
+        "--local-vad-aggressiveness",
+        type=int,
+        default=2,
+        choices=(0, 1, 2, 3),
+        help="WebRTC VAD aggressiveness (0..3). Higher => more aggressive filtering. [experimental]",
     )
     parser.add_argument(
-        "--synthesize-command",
-        default=None,
-        type=str,
-        help="Command to run when the response is generated",
+        "--local-vad-frame-ms",
+        type=int,
+        default=30,
+        choices=(10, 20, 30),
+        help="WebRTC VAD frame size in ms (10/20/30). [experimental]",
     )
     parser.add_argument(
-        "--tts-played-command",
-        default=None,
-        type=str,
-        help="Command to run when tts was played",
+        "--local-vad-min-speech-ms",
+        type=int,
+        default=150,
+        help="How much speech (ms) needed to trigger VAD_START. [experimental]",
     )
     parser.add_argument(
-        "--error-command",
-        default=None,
-        type=str,
-        help="Command to run when an error occurred",
+        "--local-vad-min-silence-ms",
+        type=int,
+        default=600,
+        help="How much silence (ms) needed after speech to trigger VAD_END. [experimental]",
     )
-    #
+    parser.add_argument(
+        "--local-vad-start-delay-ms",
+        type=int,
+        default=0,
+        help="Ignore VAD for first N ms after wake (helps filter wake beep echo). [experimental]",
+    )
+
+    # Sounds/commands
+    parser.add_argument("--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac"))
+    parser.add_argument(
+        "--thinking-sound",
+        default=str(_SOUNDS_DIR / "processing.wav"),
+        help="Short sound to play while assistant is processing (thinking)",
+    )
+    parser.add_argument("--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac"))
+
+    parser.add_argument("--wake-command", default=None, type=str,
+                        help="Command to run when wake word was triggered [experimental]")
+    parser.add_argument("--sst-stop-command", default=None, type=str,
+                        help="Command to run when the user stops speaking [experimental]")
+    parser.add_argument("--synthesize-command", default=None, type=str,
+                        help="Command to run when the response is generated (intent start) [experimental]")
+    parser.add_argument("--tts-played-command", default=None, type=str,
+                        help="Command to run when tts was played [experimental]")
+    parser.add_argument("--error-command", default=None, type=str,
+                        help="Command to run when an error occurred [experimental]")
+
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
-    #
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Address for ESPHome server (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=6053, help="Port for ESPHome server (default: 6053)"
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Print DEBUG messages to console"
-    )
+
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="Address for ESPHome server (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=6053,
+                        help="Port for ESPHome server (default: 6053)")
+    parser.add_argument("--debug", action="store_true", help="Print DEBUG messages to console")
+
     args = parser.parse_args()
 
     if args.list_input_devices:
@@ -140,11 +429,9 @@ async def main() -> None:
 
     if args.list_output_devices:
         from mpv import MPV
-
         player = MPV()
         print("Output devices")
         print("=" * 14)
-
         for speaker in player.audio_device_list:  # type: ignore
             print(speaker["name"] + ":", speaker["description"])
         return
@@ -161,7 +448,6 @@ async def main() -> None:
             args.audio_input_device = int(args.audio_input_device)
         except ValueError:
             pass
-
         mic = sc.get_microphone(args.audio_input_device)
     else:
         mic = sc.default_microphone()
@@ -174,7 +460,6 @@ async def main() -> None:
         for model_config_path in wake_word_dir.glob("*.json"):
             model_id = model_config_path.stem
             if model_id == args.stop_model:
-                # Don't show stop model as an available wake word
                 continue
 
             with open(model_config_path, "r", encoding="utf-8") as model_config_file:
@@ -205,37 +490,37 @@ async def main() -> None:
     else:
         preferences = Preferences()
 
+    # Determine initial VAD mode (CLI overrides preferences)
+    va_mode = (args.va_mode or preferences.va_mode or "ha").strip().lower()
+    if va_mode not in ("ha", "local"):
+        va_mode = "ha"
+
     # Load wake/stop models
     active_wake_words: Set[str] = set()
     wake_models: Dict[str, Union[MicroWakeWord, OpenWakeWord]] = {}
+
     if preferences.active_wake_words:
-        # Load preferred models
         for wake_word_id in preferences.active_wake_words:
             wake_word = available_wake_words.get(wake_word_id)
             if wake_word is None:
                 _LOGGER.warning("Unrecognized wake word id: %s", wake_word_id)
                 continue
-
             _LOGGER.debug("Loading wake model: %s", wake_word_id)
             wake_models[wake_word_id] = wake_word.load()
             active_wake_words.add(wake_word_id)
 
     if not wake_models:
-        # Load default model
         wake_word_id = args.wake_model
         wake_word = available_wake_words[wake_word_id]
-
         _LOGGER.debug("Loading wake model: %s", wake_word_id)
         wake_models[wake_word_id] = wake_word.load()
         active_wake_words.add(wake_word_id)
 
-    # TODO: allow openWakeWord for "stop"
     stop_model: Optional[MicroWakeWord] = None
     for wake_word_dir in wake_word_dirs:
         stop_config_path = wake_word_dir / f"{args.stop_model}.json"
         if not stop_config_path.exists():
             continue
-
         _LOGGER.debug("Loading stop model: %s", stop_config_path)
         stop_model = MicroWakeWord.from_config(stop_config_path)
         break
@@ -245,15 +530,14 @@ async def main() -> None:
     state = ServerState(
         name=args.name,
         mac_address=get_mac(),
-        # Small bounded queue prevents unbounded memory growth if HA/network stalls.
         audio_queue=Queue(maxsize=8),
         entities=[],
         available_wake_words=available_wake_words,
         wake_words=wake_models,
         active_wake_words=active_wake_words,
         stop_word=stop_model,
-        music_player=MpvMediaPlayer(device=args.audio_output_device),
-        tts_player=MpvMediaPlayer(device=args.audio_output_device),
+        music_player=None,  # will be set by satellite entities (kept for compatibility)
+        tts_player=None,    # will be set by satellite entities (kept for compatibility)
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
         thinking_sound=args.thinking_sound,
@@ -266,27 +550,47 @@ async def main() -> None:
         tts_played_command=args.tts_played_command,
         error_command=args.error_command,
         wakeword_threshold=args.wakeword_threshold,
+        va_mode=va_mode,
+        local_vad_aggressiveness=args.local_vad_aggressiveness,
+        local_vad_frame_ms=args.local_vad_frame_ms,
+        local_vad_min_speech_ms=args.local_vad_min_speech_ms,
+        local_vad_min_silence_ms=args.local_vad_min_silence_ms,
+        local_vad_start_delay_ms=args.local_vad_start_delay_ms,
     )
+
+    # NOTE: Mpv players are created in satellite constructor in your current repo layout.
+    # If your ServerState requires them here, re-add MpvMediaPlayer imports/creation.
+    from .mpv_player import MpvMediaPlayer
+    state.music_player = MpvMediaPlayer(device=args.audio_output_device)
+    state.tts_player = MpvMediaPlayer(device=args.audio_output_device)
+
+    # Save resolved mode back to preferences (so it matches dropdown default on first connect)
+    state.preferences.va_mode = state.va_mode
+    try:
+        state.save_preferences()
+    except Exception:
+        _LOGGER.exception("Failed to save preferences at startup")
+
+    loop = asyncio.get_running_loop()
 
     process_audio_thread = threading.Thread(
         target=process_audio,
-        args=(state, mic, args.audio_input_block_size),
+        args=(state, mic, args.audio_input_block_size, loop),
         daemon=True,
     )
     process_audio_thread.start()
 
-    loop = asyncio.get_running_loop()
     sender_thread = threading.Thread(
         target=audio_sender_thread,
         args=(state, loop),
         daemon=True,
     )
     sender_thread.start()
+
     server = await loop.create_server(
         lambda: VoiceSatelliteProtocol(state), host=args.host, port=args.port
     )
 
-    # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=args.name)
     await discovery.register_server()
 
@@ -297,216 +601,22 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # stop sender thread cleanly
         try:
             state.audio_queue.put_nowait(None)
         except Full:
-            state.audio_queue.get_nowait()
-        except Empty:
-            pass
-        state.audio_queue.put_nowait(None)
-        sender_thread.join(timeout=2.0)
-
-    _LOGGER.debug("Server stopped")
-
-
-# -----------------------------------------------------------------------------
-def enqueue_audio(state: ServerState, audio_chunk: bytes) -> None:
-    """Put audio into bounded queue, dropping oldest on overflow to keep latency low."""
-    try:
-        state.audio_queue.put_nowait(audio_chunk)
-    except Full:
-        try:
-            state.audio_queue.get_nowait()
-        except Empty:
-            pass
-        try:
-            state.audio_queue.put_nowait(audio_chunk)
-        except Full:
-            pass
-
-
-def _send_audio_batch(state: ServerState, batch: list[bytes]) -> None:
-    """Runs in asyncio thread (event loop)."""
-    sat = state.satellite
-    if sat is None:
-        return
-    if not getattr(sat, "is_streaming_audio", False):
-        return
-
-    from aioesphomeapi.api_pb2 import VoiceAssistantAudio  # local import avoids global overhead
-    sat.send_messages([VoiceAssistantAudio(data=b) for b in batch])
-
-
-def audio_sender_thread(state: ServerState, loop: asyncio.AbstractEventLoop, batch_size: int = 4) -> None:
-    """Blocking sender thread: batches audio and schedules 1 callback per batch."""
-    while True:
-        chunk = state.audio_queue.get()
-        if chunk is None:
-            return
-
-        batch = [chunk]
-        # Drain a few more to batch
-        for _ in range(batch_size - 1):
             try:
-                batch.append(state.audio_queue.get_nowait())
+                state.audio_queue.get_nowait()
             except Empty:
-                break
+                pass
+            try:
+                state.audio_queue.put_nowait(None)
+            except Full:
+                pass
 
-        loop.call_soon_threadsafe(_send_audio_batch, state, batch)
+        sender_thread.join(timeout=2.0)
+        _LOGGER.debug("Server stopped")
 
-def process_audio(state: ServerState, mic, block_size: int):
-    """Process audio chunks from the microphone.
-
-    - This function runs in a *dedicated OS thread*.
-    - It must NOT call asyncio transport methods directly.
-      All network I/O is delegated to VoiceSatelliteProtocol via thread-safe scheduling
-      (see satellite.py).
-    - To reduce CPU usage on small devices:
-        * Only send audio to Home Assistant when streaming is active.
-        * Only evaluate the stop-word model when it is enabled/active.
-    """
-
-    wake_words: List[Union[MicroWakeWord, OpenWakeWord]] = []
-    micro_features: Optional[MicroWakeWordFeatures] = None
-    micro_inputs: List[np.ndarray] = []
-
-    oww_features: Optional[OpenWakeWordFeatures] = None
-    oww_inputs: List[np.ndarray] = []
-    has_oww = False
-
-    last_active: Optional[float] = None
-
-    try:
-        _LOGGER.debug("Opening audio input device: %s", mic.name)
-        with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
-            while True:
-                audio_chunk_array = mic_in.record(block_size).reshape(-1)
-                audio_chunk_array = np.nan_to_num(audio_chunk_array, nan=0.0, posinf=0.0, neginf=0.0)
-                audio_chunk_array = np.clip(audio_chunk_array, -1.0, 1.0)
-                audio_chunk = (
-                    (audio_chunk_array * 32767.0)
-                    .astype("<i2")  # little-endian 16-bit signed
-                    .tobytes()
-                )
-
-                sat = state.satellite
-                if sat is None:
-                    continue
-
-                # If muted, skip heavy work (wakeword + features) to save CPU.
-                # We still keep the recorder running.
-                if state.muted:
-                    continue
-
-                # If HA pipeline is actively listening/streaming:
-                # - enqueue audio (already handled below)
-                # - DO NOT run wake word models (wasteful and can add load/jitter)
-                # - optionally run stop-word detection (only if enabled)
-                streaming = getattr(sat, "is_streaming_audio", False)
-                pipeline_active = getattr(sat, "pipeline_active", False)
-                block_wake_words = getattr(sat, "block_wake_words", False) or pipeline_active or streaming
-
-                if (not wake_words) or (state.wake_words_changed and state.wake_words):
-                    # Update list of wake word models to process
-                    state.wake_words_changed = False
-                    wake_words = [
-                        ww
-                        for ww in state.wake_words.values()
-                        if ww.id in state.active_wake_words
-                    ]
-
-                    has_oww = any(isinstance(ww, OpenWakeWord) for ww in wake_words)
-
-                    if micro_features is None:
-                        micro_features = MicroWakeWordFeatures()
-
-                    if has_oww and (oww_features is None):
-                        oww_features = OpenWakeWordFeatures.from_builtin()
-
-                try:
-                    # Send mic audio only while HA is actively streaming/listening
-                    if streaming:
-                        enqueue_audio(state, audio_chunk)
-
-                    # Always suppress wakeword detection while a pipeline run is active.
-                    # Otherwise device audio / echo can retrigger wake words mid-run.
-                    if block_wake_words:
-                        # Still allow stop-word detection during the whole run (STT, intent, TTS),
-                        # so user can interrupt TTS or cancel.
-                        should_check_stop = (
-                                (not state.muted)
-                                and (state.stop_word.id in state.active_wake_words)
-                        )
-                        if should_check_stop:
-                            if micro_features is None:
-                                micro_features = MicroWakeWordFeatures()
-
-                            micro_inputs.clear()
-                            micro_inputs.extend(micro_features.process_streaming(audio_chunk))
-
-                            for micro_input in micro_inputs:
-                                if state.stop_word.process_streaming(micro_input):
-                                    sat.stop()
-                                    break
-
-                        continue  # <-- IMPORTANT: never run wake word detection during pipeline_active
-
-                    assert micro_features is not None
-                    micro_inputs.clear()
-                    micro_inputs.extend(micro_features.process_streaming(audio_chunk))
-
-                    if has_oww:
-                        assert oww_features is not None
-                        oww_inputs.clear()
-                        oww_inputs.extend(oww_features.process_streaming(audio_chunk))
-
-                    # Wake word detection
-                    for wake_word in wake_words:
-                        activated = False
-                        if isinstance(wake_word, MicroWakeWord):
-                            for micro_input in micro_inputs:
-                                if wake_word.process_streaming(micro_input):
-                                    activated = True
-                        elif isinstance(wake_word, OpenWakeWord):
-                            for oww_input in oww_inputs:
-                                for prob in wake_word.process_streaming(oww_input):
-                                    if prob > state.wakeword_threshold:
-                                        activated = True
-
-                        if activated and not state.muted:
-                            # Check refractory
-                            now = time.monotonic()
-                            if (last_active is None) or (
-                                    (now - last_active) > state.refractory_seconds
-                            ):
-                                sat.wakeup(wake_word)
-                                last_active = now
-                                # Once triggered, don't keep evaluating other wake words this block
-                                break
-
-                    # Stop word detection: only when stop word is enabled/active.
-                    should_check_stop = (
-                            (not state.muted)
-                            and (state.stop_word.id in state.active_wake_words)
-                    )
-                    if should_check_stop:
-                        stopped = False
-                        for micro_input in micro_inputs:
-                            if state.stop_word.process_streaming(micro_input):
-                                stopped = True
-                                break
-
-                        if stopped:
-                            sat.stop()
-
-                except Exception:
-                    _LOGGER.exception("Unexpected error handling audio")
-    except Exception:
-        _LOGGER.exception("Unexpected error processing audio")
-        sys.exit(1)
-
-
-# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     asyncio.run(main())
