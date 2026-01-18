@@ -24,7 +24,7 @@ class LocalVADConfig:
     aggressiveness: int = 2            # 0..3
     min_speech_ms: int = 150
     min_silence_ms: int = 600
-    start_delay_ms: int = 0            # ignore VAD for first N ms after wake (optional)
+    start_delay_ms: int = 300            # ignore VAD for first N ms after wake (optional)
 
 
 class LocalWebRTCVAD:
