@@ -79,6 +79,23 @@ Then add `--wake-word-dir <DIR>` pointing to the directory containing `glados.tf
 3. Choose "ESPHome" and then "Set up another instance of ESPHome"
 4. Enter the IP address of your voice satellite with port 6053
 5. Click "Submit"
+
+## Home Assistant Device Controls
+
+Once connected, the device exposes several entities in Home Assistant:
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| Media Player | media_player | Play/pause/stop audio, announcements, TTS playback |
+| Mute | switch | Enable/disable microphone input |
+| Volume | number (0-100%) | Output volume for TTS and sounds |
+| Wakeword Threshold | number (0-1) | Wake word detection sensitivity (higher = less sensitive) |
+| VAD Mode | select (ha/local) | Voice activity detection mode |
+
+### VAD Mode Options
+
+- **ha** (default): Uses Home Assistant's pipeline for voice activity detection
+- **local**: Uses local WebRTC VAD for faster speech end detection (reduces latency)
    
 ## UX Feedback: Sounds and Command Hooks
 
