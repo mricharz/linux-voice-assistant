@@ -170,11 +170,7 @@ class VoiceSatelliteProtocol(APIServer):
                 name="Wakeword Threshold",
                 object_id="wakeword_threshold",
                 get_value=lambda: self.state.wakeword_threshold,
-                set_value=lambda v: setattr(
-                    self.state,
-                    "wakeword_threshold",
-                    max(0.0, min(1.0, float(v))),
-                ),
+                set_value=self.set_wakeword_threshold,
                 min_value=0.0,
                 max_value=1.0,
                 step=0.01,
@@ -269,6 +265,16 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.save_preferences()
         except Exception:
             _LOGGER.exception("Failed to save preferences after VAD mode change")
+
+    def set_wakeword_threshold(self, new_threshold: float) -> None:
+        """Update wakeword threshold (called from HA number entity)."""
+        threshold = max(0.0, min(1.0, float(new_threshold)))
+
+        if self.state.wakeword_threshold == threshold:
+            return
+
+        _LOGGER.info("Wakeword threshold set to: %.2f", threshold)
+        self.state.wakeword_threshold = threshold
 
     def set_volume(self, new_volume: float) -> None:
         """Update output volume (called from HA number entity)."""

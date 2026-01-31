@@ -181,6 +181,10 @@ def process_audio(
                         for ww in state.wake_words.values()
                         if ww.id in state.active_wake_words
                     ]
+                    _LOGGER.debug(
+                        "Active wake words: %s",
+                        [ww.id for ww in wake_words] if wake_words else "none"
+                    )
                     has_oww = any(isinstance(ww, OpenWakeWord) for ww in wake_words)
                     if micro_features is None:
                         micro_features = MicroWakeWordFeatures()

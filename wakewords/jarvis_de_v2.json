@@ -1,6 +1,6 @@
 {
   "type": "micro",
-  "wake_word": "Jarvis",
+  "wake_word": "Jarvis (DE)",
   "author": "Manuel Richarz",
   "website": "https://gitlab.com/richarz/custom_micro_wake_words",
   "model": "jarvis_de_v2.tflite",
