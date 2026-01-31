@@ -564,6 +564,11 @@ async def main() -> None:
     state.music_player = MpvMediaPlayer(device=args.audio_output_device)
     state.tts_player = MpvMediaPlayer(device=args.audio_output_device)
 
+    # Apply saved volume to players
+    initial_volume = state.preferences.volume
+    state.music_player.set_volume(initial_volume)
+    state.tts_player.set_volume(initial_volume)
+
     # Save resolved mode back to preferences (so it matches dropdown default on first connect)
     state.preferences.va_mode = state.va_mode
     try:

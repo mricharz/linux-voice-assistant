@@ -203,6 +203,29 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.entities.append(va_mode_entity)
 
         self.state.va_mode_entity.server = self
+
+        # Volume slider (0-100%)
+        volume_entity = self.state.volume_entity
+        if volume_entity is None:
+            volume_entity = NumberEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Volume",
+                object_id="volume",
+                get_value=lambda: float(self.state.preferences.volume),
+                set_value=self.set_volume,
+                min_value=0.0,
+                max_value=100.0,
+                step=1.0,
+                icon="mdi:volume-high",
+            )
+            self.state.entities.append(volume_entity)
+            self.state.volume_entity = volume_entity
+        elif volume_entity not in self.state.entities:
+            self.state.entities.append(volume_entity)
+
+        self.state.volume_entity.server = self
+
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -------------------------------------------------------------------------
@@ -246,6 +269,25 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.save_preferences()
         except Exception:
             _LOGGER.exception("Failed to save preferences after VAD mode change")
+
+    def set_volume(self, new_volume: float) -> None:
+        """Update output volume (called from HA number entity)."""
+        volume = int(max(0, min(100, new_volume)))
+
+        if self.state.preferences.volume == volume:
+            return
+
+        _LOGGER.info("Volume set to: %d%%", volume)
+        self.state.preferences.volume = volume
+
+        # Apply volume to both players
+        self.state.music_player.set_volume(volume)
+        self.state.tts_player.set_volume(volume)
+
+        try:
+            self.state.save_preferences()
+        except Exception:
+            _LOGGER.exception("Failed to save preferences after volume change")
 
     # -------------------------------------------------------------------------
 

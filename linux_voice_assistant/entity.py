@@ -270,6 +270,7 @@ class NumberEntity(ESPHomeEntity):
             min_value: float,
             max_value: float,
             step: float,
+            icon: str = "mdi:tune-vertical",
     ) -> None:
         ESPHomeEntity.__init__(self, server)
         self.key = key
@@ -280,6 +281,7 @@ class NumberEntity(ESPHomeEntity):
         self.min_value = min_value
         self.max_value = max_value
         self.step = step
+        self.icon = icon
 
     def update_callbacks(
             self, get_value: Callable[[], float], set_value: Callable[[float], None]
@@ -301,7 +303,7 @@ class NumberEntity(ESPHomeEntity):
                 max_value=self.max_value,
                 step=self.step,
                 entity_category=EntityCategory.CONFIG,
-                icon="mdi:tune-vertical",
+                icon=self.icon,
             )
 
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):

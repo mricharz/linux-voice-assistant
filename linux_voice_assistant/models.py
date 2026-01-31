@@ -57,6 +57,9 @@ class Preferences:
     # - "local": use local WebRTC VAD to cut mic earlier (faster, less waiting)
     va_mode: str = "ha"
 
+    # Output volume (0-100%)
+    volume: int = 100
+
 
 @dataclass
 class ServerState:
@@ -92,6 +95,7 @@ class ServerState:
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None
     threshold_entity: "Optional[NumberEntity]" = None
     va_mode_entity: "Optional[SelectEntity]" = None
+    volume_entity: "Optional[NumberEntity]" = None
 
     # Wakeword/runtime state
     wake_words_changed: bool = False
