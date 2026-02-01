@@ -318,6 +318,8 @@ def process_audio(
                                     prob_mean = sum(wake_word._probabilities) / len(wake_word._probabilities)
                                     prob_info = f" (prob={prob_mean:.3f}, cutoff={wake_word.probability_cutoff:.3f})"
                                 _LOGGER.info("Wake word activated: %s%s", wake_word.id, prob_info)
+                                # Reset internal state to prevent re-triggering
+                                wake_word.reset()
                             else:
                                 _LOGGER.info("Wake word activated: %s", wake_word.id)
 
