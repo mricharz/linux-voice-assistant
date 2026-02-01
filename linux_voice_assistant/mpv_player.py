@@ -12,7 +12,12 @@ _LOGGER = logging.getLogger(__name__)
 
 class MpvMediaPlayer:
     def __init__(self, device: Optional[str] = None) -> None:
-        self.player = MPV()
+        self.player = MPV(
+            # Low-latency audio settings
+            audio_buffer=0.1,  # Reduce audio buffer (default ~0.2-0.5s)
+            cache="no",  # Disable cache for faster start
+            demuxer_readahead_secs=0,  # No read-ahead buffering
+        )
 
         if device:
             self.player["audio-device"] = device
