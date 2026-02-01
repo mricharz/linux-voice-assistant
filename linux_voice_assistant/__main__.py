@@ -281,7 +281,21 @@ def process_audio(
 
                     if isinstance(wake_word, MicroWakeWord):
                         for micro_input in micro_inputs:
-                            if wake_word.process_streaming(micro_input):
+                            detected = wake_word.process_streaming(micro_input)
+
+                            # Debug logging: show probability when above noise floor
+                            if hasattr(wake_word, "_probabilities") and wake_word._probabilities:
+                                prob_mean = sum(wake_word._probabilities) / len(wake_word._probabilities)
+                                if prob_mean > 0.1:  # Only log when above noise floor
+                                    _LOGGER.debug(
+                                        "MicroWakeWord '%s': prob=%.3f (cutoff=%.3f) [%s]",
+                                        wake_word.id,
+                                        prob_mean,
+                                        wake_word.probability_cutoff,
+                                        "ACTIVATED" if detected else "not activated",
+                                    )
+
+                            if detected:
                                 activated = True
                                 break
 
@@ -297,6 +311,16 @@ def process_audio(
                     if activated:
                         now = time.monotonic()
                         if (last_active is None) or ((now - last_active) > state.refractory_seconds):
+                            # Log activation with probability info
+                            if isinstance(wake_word, MicroWakeWord):
+                                prob_info = ""
+                                if hasattr(wake_word, "_probabilities") and wake_word._probabilities:
+                                    prob_mean = sum(wake_word._probabilities) / len(wake_word._probabilities)
+                                    prob_info = f" (prob={prob_mean:.3f}, cutoff={wake_word.probability_cutoff:.3f})"
+                                _LOGGER.info("Wake word activated: %s%s", wake_word.id, prob_info)
+                            else:
+                                _LOGGER.info("Wake word activated: %s", wake_word.id)
+
                             _schedule_sat_wakeup(loop, state, wake_word)
                             last_active = now
                         break
@@ -519,6 +543,16 @@ async def main() -> None:
         _LOGGER.debug("Loading wake model: %s", wake_word_id)
         wake_models[wake_word_id] = wake_word.load()
         active_wake_words.add(wake_word_id)
+
+    # Apply wakeword_threshold to all loaded MicroWakeWord models
+    for model_id, model in wake_models.items():
+        if isinstance(model, MicroWakeWord):
+            model.probability_cutoff = args.wakeword_threshold
+            _LOGGER.debug(
+                "Set MicroWakeWord '%s' probability_cutoff to %.2f",
+                model_id,
+                args.wakeword_threshold,
+            )
 
     stop_model: Optional[MicroWakeWord] = None
     for wake_word_dir in wake_word_dirs:

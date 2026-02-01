@@ -276,6 +276,16 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.info("Wakeword threshold set to: %.2f", threshold)
         self.state.wakeword_threshold = threshold
 
+        # Also update threshold on all loaded MicroWakeWord models
+        for wake_word in self.state.wake_words.values():
+            if isinstance(wake_word, MicroWakeWord):
+                wake_word.probability_cutoff = threshold
+                _LOGGER.debug(
+                    "Updated MicroWakeWord '%s' probability_cutoff to %.2f",
+                    wake_word.id,
+                    threshold,
+                )
+
     def set_volume(self, new_volume: float) -> None:
         """Update output volume (called from HA number entity)."""
         volume = int(max(0, min(100, new_volume)))
@@ -549,7 +559,18 @@ class VoiceSatelliteProtocol(APIServer):
                     continue
 
                 _LOGGER.debug("Loading wake word: %s", model_info.wake_word_path)
-                self.state.wake_words[wake_word_id] = model_info.load()
+                loaded_model = model_info.load()
+
+                # Apply current threshold to MicroWakeWord models
+                if isinstance(loaded_model, MicroWakeWord):
+                    loaded_model.probability_cutoff = self.state.wakeword_threshold
+                    _LOGGER.debug(
+                        "Set MicroWakeWord '%s' probability_cutoff to %.2f",
+                        loaded_model.id,
+                        self.state.wakeword_threshold,
+                    )
+
+                self.state.wake_words[wake_word_id] = loaded_model
 
                 _LOGGER.info("Wake word set: %s", wake_word_id)
                 active_wake_words.add(wake_word_id)
