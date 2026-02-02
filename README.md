@@ -137,7 +137,7 @@ python3 -m linux_voice_assistant ... \
 | `wake` | Wake word detected, assistant starts listening |
 | `stt_end` | User stopped speaking |
 | `intent_start` | Processing user request (thinking) |
-| `tts_end` | TTS response finished |
+| `speak` | TTS playback started |
 | `idle` | Pipeline finished, back to listening |
 | `stop` | Stop word detected |
 | `timer_started` | A timer has been started |

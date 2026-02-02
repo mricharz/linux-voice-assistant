@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Install LED Service for Linux Voice Assistant.
+
+Usage:
+    sudo python3 install-led-service.py [options]
+
+Options:
+    --socket PATH       Socket path (default: /run/lva/led.sock)
+    --n NUM             Number of LEDs (default: 12)
+    --brightness NUM    LED brightness 0-31 (default: 8)
+    --uninstall         Remove the service
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SERVICE_NAME = "lva-led"
+SERVICE_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
+
+
+def check_root():
+    """Ensure script is run as root."""
+    if os.geteuid() != 0:
+        print("Error: This script must be run as root (sudo)", file=sys.stderr)
+        sys.exit(1)
+
+
+def install_dependencies():
+    """Install required Python packages."""
+    print("Installing dependencies...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "spidev"],
+        check=True
+    )
+    print("Dependencies installed: spidev")
+
+
+def install(socket_path: str, n: int, brightness: int):
+    """Install the LED service."""
+    script_dir = Path(__file__).parent.resolve()
+    led_service_py = script_dir / "led-service.py"
+
+    if not led_service_py.exists():
+        print(f"Error: {led_service_py} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Install Python dependencies
+    install_dependencies()
+
+    # Create systemd service file
+    service_content = f"""[Unit]
+Description=LED Service for Linux Voice Assistant
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={script_dir}
+ExecStartPre=/bin/mkdir -p {Path(socket_path).parent}
+ExecStart=/usr/bin/python3 {led_service_py} {socket_path} --n {n} --brightness {brightness}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    SERVICE_FILE.write_text(service_content)
+    print(f"Created: {SERVICE_FILE}")
+    print(f"Script: {led_service_py}")
+
+    # Reload systemd and enable service
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", SERVICE_NAME], check=True)
+    subprocess.run(["systemctl", "restart", SERVICE_NAME], check=True)
+
+    print(f"\nService '{SERVICE_NAME}' installed and started!")
+    print(f"Socket: {socket_path}")
+    print(f"\nCommands:")
+    print(f"  systemctl status {SERVICE_NAME}")
+    print(f"  journalctl -u {SERVICE_NAME} -f")
+    print(f"\nTo use with linux-voice-assistant:")
+    print(f"  python3 -m linux_voice_assistant --name 'Name' --event-socket {socket_path}")
+
+
+def uninstall():
+    """Remove the LED service."""
+    # Stop and disable service
+    subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
+    subprocess.run(["systemctl", "disable", SERVICE_NAME], check=False)
+
+    # Remove service file
+    if SERVICE_FILE.exists():
+        SERVICE_FILE.unlink()
+        print(f"Removed: {SERVICE_FILE}")
+
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+
+    print(f"\nService '{SERVICE_NAME}' uninstalled!")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Install LED Service for Linux Voice Assistant")
+    parser.add_argument("--socket", default="/run/lva/led.sock", help="Socket path (default: /run/lva/led.sock)")
+    parser.add_argument("--n", type=int, default=12, help="Number of LEDs (default: 12)")
+    parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31 (default: 8)")
+    parser.add_argument("--uninstall", action="store_true", help="Remove the service")
+    args = parser.parse_args()
+
+    check_root()
+
+    if args.uninstall:
+        uninstall()
+    else:
+        install(args.socket, args.n, args.brightness)
+
+
+if __name__ == "__main__":
+    main()
