@@ -2,7 +2,7 @@
 """Install LED Service for Linux Voice Assistant.
 
 Usage:
-    sudo python3 install-led-service.py [options]
+    sudo python3 setup [options]
 
 Options:
     --socket PATH       Socket path (default: /run/lva/led.sock)
@@ -13,8 +13,10 @@ Options:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 SERVICE_NAME = "lva-led"
@@ -28,28 +30,33 @@ def check_root():
         sys.exit(1)
 
 
-def install_dependencies():
-    """Install required Python packages."""
+def setup_venv(venv_dir: Path):
+    """Create virtual environment and install dependencies."""
+    print(f"Creating virtual environment: {venv_dir}")
+    venv.create(venv_dir, with_pip=True)
+
+    venv_python = venv_dir / "bin" / "python"
     print("Installing dependencies...")
-    # Use --break-system-packages for PEP 668 compliant systems (Debian 12+, Pi OS Bookworm+)
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "spidev"],
+        [str(venv_python), "-m", "pip", "install", "--quiet", "spidev"],
         check=True
     )
     print("Dependencies installed: spidev")
+    return venv_python
 
 
 def install(socket_path: str, n: int, brightness: int):
     """Install the LED service."""
     script_dir = Path(__file__).parent.resolve()
     led_service_py = script_dir / "led-service.py"
+    venv_dir = script_dir / ".venv"
 
     if not led_service_py.exists():
         print(f"Error: {led_service_py} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Install Python dependencies
-    install_dependencies()
+    # Create venv and install dependencies
+    venv_python = setup_venv(venv_dir)
 
     # Create systemd service file
     service_content = f"""[Unit]
@@ -61,7 +68,7 @@ Type=simple
 User=root
 WorkingDirectory={script_dir}
 ExecStartPre=/bin/mkdir -p {Path(socket_path).parent}
-ExecStart=/usr/bin/python3 {led_service_py} {socket_path} --n {n} --brightness {brightness}
+ExecStart={venv_python} {led_service_py} {socket_path} --n {n} --brightness {brightness}
 Restart=always
 RestartSec=3
 
@@ -89,6 +96,9 @@ WantedBy=multi-user.target
 
 def uninstall():
     """Remove the LED service."""
+    script_dir = Path(__file__).parent.resolve()
+    venv_dir = script_dir / ".venv"
+
     # Stop and disable service
     subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
     subprocess.run(["systemctl", "disable", SERVICE_NAME], check=False)
@@ -97,6 +107,11 @@ def uninstall():
     if SERVICE_FILE.exists():
         SERVICE_FILE.unlink()
         print(f"Removed: {SERVICE_FILE}")
+
+    # Remove venv
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+        print(f"Removed: {venv_dir}")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
 
