@@ -19,6 +19,10 @@ import sys
 import venv
 from pathlib import Path
 
+_DIR = Path(__file__).parent.resolve()
+_VENV_DIR = _DIR / ".venv"
+_LED_SERVICE = _DIR / "led-service.py"
+
 SERVICE_NAME = "lva-led"
 SERVICE_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
@@ -30,35 +34,30 @@ def check_root():
         sys.exit(1)
 
 
-def setup_venv(venv_dir: Path):
+def setup_venv():
     """Create virtual environment and install dependencies."""
-    print(f"Creating virtual environment: {venv_dir}")
-    venv.create(venv_dir, with_pip=True)
+    print(f"Creating virtual environment: {_VENV_DIR}")
 
-    venv_python = venv_dir / "bin" / "python"
-    print("Installing dependencies...")
-    subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--quiet", "spidev"],
-        check=True
-    )
+    builder = venv.EnvBuilder(with_pip=True)
+    builder.create(_VENV_DIR)
+    context = builder.ensure_directories(_VENV_DIR)
+
+    pip = [context.env_exe, "-m", "pip"]
+    subprocess.check_call(pip + ["install", "--upgrade", "--quiet", "pip"])
+    subprocess.check_call(pip + ["install", "--quiet", "spidev"])
+
     print("Dependencies installed: spidev")
-    return venv_python
+    return context.env_exe
 
 
 def install(socket_path: str, n: int, brightness: int):
     """Install the LED service."""
-    script_dir = Path(__file__).parent.resolve()
-    led_service_py = script_dir / "led-service.py"
-    venv_dir = script_dir / ".venv"
-
-    if not led_service_py.exists():
-        print(f"Error: {led_service_py} not found", file=sys.stderr)
+    if not _LED_SERVICE.exists():
+        print(f"Error: {_LED_SERVICE} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Create venv and install dependencies
-    venv_python = setup_venv(venv_dir)
+    venv_python = setup_venv()
 
-    # Create systemd service file
     service_content = f"""[Unit]
 Description=LED Service for Linux Voice Assistant
 After=network.target
@@ -66,9 +65,9 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory={script_dir}
+WorkingDirectory={_DIR}
 ExecStartPre=/bin/mkdir -p {Path(socket_path).parent}
-ExecStart={venv_python} {led_service_py} {socket_path} --n {n} --brightness {brightness}
+ExecStart={venv_python} {_LED_SERVICE} {socket_path} --n {n} --brightness {brightness}
 Restart=always
 RestartSec=3
 
@@ -78,12 +77,10 @@ WantedBy=multi-user.target
 
     SERVICE_FILE.write_text(service_content)
     print(f"Created: {SERVICE_FILE}")
-    print(f"Script: {led_service_py}")
 
-    # Reload systemd and enable service
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", SERVICE_NAME], check=True)
-    subprocess.run(["systemctl", "restart", SERVICE_NAME], check=True)
+    subprocess.check_call(["systemctl", "daemon-reload"])
+    subprocess.check_call(["systemctl", "enable", SERVICE_NAME])
+    subprocess.check_call(["systemctl", "restart", SERVICE_NAME])
 
     print(f"\nService '{SERVICE_NAME}' installed and started!")
     print(f"Socket: {socket_path}")
@@ -96,33 +93,26 @@ WantedBy=multi-user.target
 
 def uninstall():
     """Remove the LED service."""
-    script_dir = Path(__file__).parent.resolve()
-    venv_dir = script_dir / ".venv"
-
-    # Stop and disable service
     subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
     subprocess.run(["systemctl", "disable", SERVICE_NAME], check=False)
 
-    # Remove service file
     if SERVICE_FILE.exists():
         SERVICE_FILE.unlink()
         print(f"Removed: {SERVICE_FILE}")
 
-    # Remove venv
-    if venv_dir.exists():
-        shutil.rmtree(venv_dir)
-        print(f"Removed: {venv_dir}")
+    if _VENV_DIR.exists():
+        shutil.rmtree(_VENV_DIR)
+        print(f"Removed: {_VENV_DIR}")
 
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-
+    subprocess.check_call(["systemctl", "daemon-reload"])
     print(f"\nService '{SERVICE_NAME}' uninstalled!")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Install LED Service for Linux Voice Assistant")
-    parser.add_argument("--socket", default="/run/lva/led.sock", help="Socket path (default: /run/lva/led.sock)")
-    parser.add_argument("--n", type=int, default=12, help="Number of LEDs (default: 12)")
-    parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31 (default: 8)")
+    parser.add_argument("--socket", default="/run/lva/led.sock", help="Socket path")
+    parser.add_argument("--n", type=int, default=12, help="Number of LEDs")
+    parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31")
     parser.add_argument("--uninstall", action="store_true", help="Remove the service")
     args = parser.parse_args()
 
