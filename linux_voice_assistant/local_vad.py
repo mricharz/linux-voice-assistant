@@ -16,6 +16,8 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+import webrtcvad  # type: ignore  # Import at module load to avoid 3s delay on first use
+
 
 @dataclass
 class LocalVADConfig:
@@ -31,9 +33,6 @@ class LocalWebRTCVAD:
     """State machine around webrtcvad.Vad()."""
 
     def __init__(self, config: LocalVADConfig) -> None:
-        # Lazy import keeps startup light (and makes stack traces clearer)
-        import webrtcvad  # type: ignore
-
         self.cfg = config
         if self.cfg.frame_ms not in (10, 20, 30):
             raise ValueError("frame_ms must be 10, 20, or 30")

@@ -339,7 +339,8 @@ class VoiceSatelliteProtocol(APIServer):
             self._speech_end_handled = False
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
-            run_command(self.state.wake_command)
+            # wake_command is now called immediately in wakeup() for lower latency
+            pass
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
             # We keep this mainly for logs/UX. No heavy work here.
@@ -611,6 +612,9 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self.duck()
+
+        # Run wake command immediately (don't wait for HA's STT_START event)
+        run_command(self.state.wake_command)
 
         try:
             self.state.tts_player.play(self.state.wakeup_sound)

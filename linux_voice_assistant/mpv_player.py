@@ -14,9 +14,10 @@ class MpvMediaPlayer:
     def __init__(self, device: Optional[str] = None) -> None:
         self.player = MPV(
             # Low-latency audio settings
-            audio_buffer=0.1,  # Reduce audio buffer (default ~0.2-0.5s)
+            audio_buffer=0.05,  # 50ms buffer for lower latency
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
+            audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
         )
 
         if device:
