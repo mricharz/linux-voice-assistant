@@ -169,6 +169,69 @@ while True:
 
 Events are sent non-blocking (~0.1ms) and do not delay the voice pipeline.
 
+## Addons
+
+The `addons/` directory contains optional services that extend Linux Voice Assistant.
+
+### LED Service (`addons/ledservice/`)
+
+A service that controls APA102 LEDs via SPI based on voice assistant events. Designed for ReSpeaker boards and similar hardware.
+
+#### Installation
+
+```sh
+sudo python3 addons/ledservice/setup --socket /run/lva/led.sock --n 12 --brightness 8
+```
+
+Options:
+- `--socket PATH`: Unix socket path (default: `/run/lva/led.sock`)
+- `--n NUM`: Number of LEDs (default: 12)
+- `--brightness NUM`: LED brightness 0-31 (default: 8)
+- `--uninstall`: Remove the service
+
+The setup script will:
+1. Install the `spidev` Python package
+2. Create and enable a systemd service (`lva-led`)
+3. Start the service
+
+#### LED Animations
+
+| Event | LED Effect |
+|-------|------------|
+| `ready` | Green blink 3x |
+| `muted` | Dim orange (50% brightness) |
+| `wake` | Yellow solid |
+| `intent_start` | Blue pulsing |
+| `speak` | Blue VU-meter (simulates speech) |
+| `stop` | Red solid 2 seconds |
+| `error` | Red blink 3x |
+| `idle` | Off |
+| `timer_started` | - |
+| `timer_finished` | - |
+
+#### Usage with Linux Voice Assistant
+
+```sh
+python3 -m linux_voice_assistant --name "Living Room" \
+  --event-socket /run/lva/led.sock
+```
+
+#### Service Management
+
+```sh
+# Check status
+sudo systemctl status lva-led
+
+# View logs
+sudo journalctl -u lva-led -f
+
+# Restart
+sudo systemctl restart lva-led
+
+# Uninstall
+sudo python3 addons/ledservice/setup --uninstall
+```
+
 ## Acoustic Echo Cancellation
 
 Enable the echo cancel PulseAudio module:
