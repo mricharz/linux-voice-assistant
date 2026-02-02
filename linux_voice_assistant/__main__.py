@@ -420,7 +420,7 @@ async def main() -> None:
         help="Ignore VAD for first N ms after wake (helps filter wake beep echo). [experimental]",
     )
 
-    # Sounds/commands
+    # Sounds
     parser.add_argument("--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac"))
     parser.add_argument(
         "--thinking-sound",
@@ -429,16 +429,13 @@ async def main() -> None:
     )
     parser.add_argument("--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac"))
 
-    parser.add_argument("--wake-command", default=None, type=str,
-                        help="Command to run when wake word was triggered [experimental]")
-    parser.add_argument("--sst-stop-command", default=None, type=str,
-                        help="Command to run when the user stops speaking [experimental]")
-    parser.add_argument("--synthesize-command", default=None, type=str,
-                        help="Command to run when the response is generated (intent start) [experimental]")
-    parser.add_argument("--tts-played-command", default=None, type=str,
-                        help="Command to run when tts was played [experimental]")
-    parser.add_argument("--error-command", default=None, type=str,
-                        help="Command to run when an error occurred [experimental]")
+    # Event sockets for external services (LED controller, etc.)
+    parser.add_argument(
+        "--event-socket",
+        action="append",
+        default=[],
+        help="Unix socket path to send events to (can be specified multiple times)",
+    )
 
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
 
@@ -567,6 +564,10 @@ async def main() -> None:
 
     assert stop_model is not None
 
+    # Create event sockets for external services
+    from .util import create_event_sockets
+    event_sockets = create_event_sockets(args.event_socket or [])
+
     state = ServerState(
         name=args.name,
         mac_address=get_mac(),
@@ -584,11 +585,6 @@ async def main() -> None:
         preferences=preferences,
         preferences_path=preferences_path,
         refractory_seconds=args.refractory_seconds,
-        wake_command=args.wake_command,
-        sst_stop_command=args.sst_stop_command,
-        synthesize_command=args.synthesize_command,
-        tts_played_command=args.tts_played_command,
-        error_command=args.error_command,
         wakeword_threshold=args.wakeword_threshold,
         va_mode=va_mode,
         local_vad_aggressiveness=args.local_vad_aggressiveness,
@@ -596,6 +592,7 @@ async def main() -> None:
         local_vad_min_speech_ms=args.local_vad_min_speech_ms,
         local_vad_min_silence_ms=args.local_vad_min_silence_ms,
         local_vad_start_delay_ms=args.local_vad_start_delay_ms,
+        event_sockets=event_sockets,
     )
 
     # NOTE: Mpv players are created in satellite constructor in your current repo layout.

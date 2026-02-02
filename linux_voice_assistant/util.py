@@ -1,12 +1,13 @@
 """Utility methods."""
 
-import uuid
 import logging
+import socket
+import uuid
 from collections.abc import Callable
-from typing import Optional
-import shlex
-import subprocess
-import os
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .models import ServerState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,21 +23,29 @@ def call_all(*callables: Optional[Callable[[], None]]) -> None:
         item()
 
 
-def run_command(command: Optional[str], env: Optional[dict] = None) -> None:
-    """Run a shell-like command in a non-blocking way."""
-    if not command:
-        return
-    _LOGGER.debug("Running %s", command)
-    try:
-        merged_env = None
-        if env:
-            merged_env = dict(os.environ)
-            merged_env.update(env)
+def create_event_sockets(paths: List[str]) -> List[Tuple[socket.socket, str]]:
+    """Create non-blocking Unix datagram sockets for event emission."""
+    sockets = []
+    for path in paths:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            sockets.append((sock, path))
+            _LOGGER.debug("Created event socket for: %s", path)
+        except Exception:
+            _LOGGER.exception("Failed to create event socket for: %s", path)
+    return sockets
 
-        subprocess.Popen(
-            shlex.split(command),
-            close_fds=True,
-            env=merged_env,
-        )
-    except Exception:
-        _LOGGER.exception("Failed to run command: %s", command)
+
+def emit_event(state: "ServerState", event: str) -> None:
+    """Emit an event to all configured event sockets (non-blocking)."""
+    if not state.event_sockets:
+        return
+    data = event.encode()
+    for sock, path in state.event_sockets:
+        try:
+            sock.sendto(data, path)
+        except BlockingIOError:
+            pass  # Socket buffer full, skip
+        except OSError:
+            pass  # Socket not available, skip

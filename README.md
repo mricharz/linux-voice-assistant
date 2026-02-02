@@ -115,29 +115,59 @@ Example:
 --thinking-sound /home/hass/sounds/thinking.wav \
 --timer-finished-sound /home/hass/sounds/timer.wav
 ```
-### Command Hooks
+### Event Sockets
 
-- `--wake-command <CMD>`: Run when wake word is triggered (assistant starts listening)
-- `--sst-stop-command <CMD>`: Run when user stops speaking (end of speech / VAD end)
-- `--synthesize-command <CMD>`: Run when response is generated (assistant "thinking" finished)
-- `--tts-played-command <CMD>`: Run when TTS has finished playing
-- `--error-command <CMD>`: Run when an error occurred
+Linux Voice Assistant can send events to external services via Unix datagram sockets.
+This is useful for LED controllers or other services that need to react to pipeline state changes.
 
-## Important: Commands MUST return quickly (non-blocking)
+Use `--event-socket <PATH>` to specify one or more socket paths (can be used multiple times):
 
-Commands are executed during the assistant pipeline. If a command blocks (e.g., infinite loop, sleeps, waiting on I/O),
-it can delay voice activity detection and degrade responsiveness.
-
-If you need a long-running animation (pulsing LEDs), start it in the background and exit immediately.
-A common pattern is to wrap commands with `bash -lc` and background them:
-```
+```sh
 python3 -m linux_voice_assistant ... \
---wake-command "bash -lc '/usr/local/bin/respeaker-led listen >/dev/null 2>&1 & disown'" \
---sst-stop-command "bash -lc '/usr/local/bin/respeaker-led off >/dev/null 2>&1 & disown'" \
---synthesize-command "bash -lc '/usr/local/bin/respeaker-led think --brightness 6 >/dev/null 2>&1 & disown'" \
---tts-played-command "bash -lc '/usr/local/bin/respeaker-led off >/dev/null 2>&1 & disown'" \
---error-command "bash -lc '/usr/local/bin/respeaker-led error >/dev/null 2>&1 & disown'"
+  --event-socket /run/lva/led.sock \
+  --event-socket /run/lva/analytics.sock
 ```
+
+#### Events
+
+| Event | Description |
+|-------|-------------|
+| `ready` | Assistant connected to HA and ready to listen |
+| `muted` | Microphone muted |
+| `wake` | Wake word detected, assistant starts listening |
+| `stt_end` | User stopped speaking |
+| `intent_start` | Processing user request (thinking) |
+| `tts_end` | TTS response finished |
+| `idle` | Pipeline finished, back to listening |
+| `stop` | Stop word detected |
+| `timer_started` | A timer has been started |
+| `timer_finished` | A timer has finished |
+| `error` | An error occurred |
+
+#### Example: LED Service
+
+A simple Python service that listens on the socket:
+
+```python
+import socket
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+sock.bind("/run/lva/led.sock")
+
+while True:
+    event = sock.recv(64).decode()
+    if event == "ready":
+        set_leds(GREEN)
+    elif event == "wake":
+        set_leds(BLUE)
+    elif event == "stt_end":
+        set_leds(YELLOW)
+    elif event == "idle":
+        set_leds(OFF)
+    # ...
+```
+
+Events are sent non-blocking (~0.1ms) and do not delay the voice pipeline.
 
 ## Acoustic Echo Cancellation
 

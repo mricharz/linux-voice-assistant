@@ -65,7 +65,7 @@ from pyopen_wakeword import OpenWakeWord
 from .api_server import APIServer
 from .entity import MediaPlayerEntity, MuteSwitchEntity, NumberEntity, SelectEntity
 from .models import ServerState
-from .util import call_all, run_command
+from .util import call_all, emit_event
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -318,8 +318,10 @@ class VoiceSatelliteProtocol(APIServer):
             except Exception:
                 _LOGGER.exception("Failed to stop TTS player while muting")
             self.state.stop_word.is_active = False
+            emit_event(self.state, "muted")
         else:
             _LOGGER.debug("Unmuting voice assistant (voice_assistant.start_continuous)")
+            emit_event(self.state, "ready")
 
     # -------------------------------------------------------------------------
 
@@ -358,11 +360,11 @@ class VoiceSatelliteProtocol(APIServer):
             if data.get("source") == "local":
                 self._send_end_of_stream_to_ha()
             self._is_streaming_audio = False
-            run_command(self.state.sst_stop_command)
+            emit_event(self.state, "stt_end")
             self._play_thinking_sound()
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_START:
-            run_command(self.state.synthesize_command)
+            emit_event(self.state, "intent_start")
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
             if data.get("tts_start_streaming") == "1":
@@ -375,7 +377,7 @@ class VoiceSatelliteProtocol(APIServer):
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_END:
             self._tts_url = data.get("url")
             self.play_tts()
-            run_command(self.state.tts_played_command)
+            emit_event(self.state, "tts_end")
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
             self._is_streaming_audio = False
@@ -438,13 +440,7 @@ class VoiceSatelliteProtocol(APIServer):
         except Exception:
             _LOGGER.exception("Failed to unduck during error cleanup")
 
-        run_command(
-            self.state.error_command,
-            env={
-                "LVA_ERROR_CODE": code,
-                "LVA_ERROR_MESSAGE": msg,
-            },
-        )
+        emit_event(self.state, "error")
 
     # -------------------------------------------------------------------------
 
@@ -454,11 +450,14 @@ class VoiceSatelliteProtocol(APIServer):
             msg: VoiceAssistantTimerEventResponse,
     ) -> None:
         _LOGGER.debug("Timer event: type=%s", event_type.name)
-        if event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_FINISHED:
+        if event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_STARTED:
+            emit_event(self.state, "timer_started")
+        elif event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_FINISHED:
             if not self._timer_finished:
                 self.state.active_wake_words.add(self.state.stop_word.id)
                 self._timer_finished = True
                 self.duck()
+                emit_event(self.state, "timer_finished")
                 self._play_timer_finished()
 
     # -------------------------------------------------------------------------
@@ -546,6 +545,7 @@ class VoiceSatelliteProtocol(APIServer):
                 max_active_wake_words=2,
             )
             _LOGGER.info("Connected to Home Assistant")
+            emit_event(self.state, "ready")
 
         elif isinstance(msg, VoiceAssistantSetConfiguration):
             active_wake_words: Set[str] = set()
@@ -613,8 +613,8 @@ class VoiceSatelliteProtocol(APIServer):
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self.duck()
 
-        # Run wake command immediately (don't wait for HA's STT_START event)
-        run_command(self.state.wake_command)
+        # Emit wake event immediately (don't wait for HA's STT_START event)
+        emit_event(self.state, "wake")
 
         try:
             self.state.tts_player.play(self.state.wakeup_sound)
@@ -624,6 +624,7 @@ class VoiceSatelliteProtocol(APIServer):
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self.state.tts_player.stop()
+        emit_event(self.state, "stop")
 
         if self._timer_finished:
             self._timer_finished = False
@@ -678,6 +679,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._is_streaming_audio = True
             self._run_started_at = time.monotonic()
             self._speech_end_handled = False
+            emit_event(self.state, "wake")  # Signal listening again
             _LOGGER.debug("Continuing conversation")
         else:
             self._block_wake_words = True
@@ -692,6 +694,7 @@ class VoiceSatelliteProtocol(APIServer):
                 # Fallback: release immediately if we have no loop (should be rare)
                 self._release_wakeword_block()
             self.unduck()
+            emit_event(self.state, "idle")
 
         _LOGGER.debug("TTS response finished")
 

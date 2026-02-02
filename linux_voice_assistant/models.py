@@ -100,14 +100,12 @@ class ServerState:
     # Wakeword/runtime state
     wake_words_changed: bool = False
     refractory_seconds: float = 2.0
-    wake_command: Optional[str] = None
-    sst_stop_command: Optional[str] = None
-    synthesize_command: Optional[str] = None
-    tts_played_command: Optional[str] = None
-    error_command: Optional[str] = None
     muted: bool = False
     connected: bool = False
     wakeword_threshold: float = 0.5
+
+    # Event sockets for notifying external services (LED controller, etc.)
+    event_sockets: "List[tuple]" = field(default_factory=list)
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
