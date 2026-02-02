@@ -31,8 +31,9 @@ def check_root():
 def install_dependencies():
     """Install required Python packages."""
     print("Installing dependencies...")
+    # Use --break-system-packages for PEP 668 compliant systems (Debian 12+, Pi OS Bookworm+)
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "spidev"],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "spidev"],
         check=True
     )
     print("Dependencies installed: spidev")
