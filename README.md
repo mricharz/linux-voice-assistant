@@ -180,12 +180,12 @@ A service that controls APA102 LEDs via SPI based on voice assistant events. Des
 #### Installation
 
 ```sh
-sudo python3 addons/ledservice/setup --socket /run/lva/led.sock --n 12 --brightness 8
+sudo python3 addons/ledservice/setup
 ```
 
 Options:
 - `--socket PATH`: Unix socket path (default: `/run/lva/led.sock`)
-- `--n NUM`: Number of LEDs (default: 12)
+- `--n NUM`: Number of LEDs (default: 3)
 - `--brightness NUM`: LED brightness 0-31 (default: 8)
 - `--uninstall`: Remove the service
 

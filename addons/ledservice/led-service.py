@@ -238,7 +238,7 @@ class LEDController:
 def main():
     parser = argparse.ArgumentParser(description="LED Service for Linux Voice Assistant")
     parser.add_argument("socket_path", help="Unix socket path to listen on")
-    parser.add_argument("--n", type=int, default=12, help="Number of LEDs (default: 12)")
+    parser.add_argument("--n", type=int, default=3, help="Number of LEDs (default: 3)")
     parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31 (default: 8)")
     args = parser.parse_args()
 

@@ -111,7 +111,7 @@ def uninstall():
 def main():
     parser = argparse.ArgumentParser(description="Install LED Service for Linux Voice Assistant")
     parser.add_argument("--socket", default="/run/lva/led.sock", help="Socket path")
-    parser.add_argument("--n", type=int, default=12, help="Number of LEDs")
+    parser.add_argument("--n", type=int, default=3, help="Number of LEDs")
     parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31")
     parser.add_argument("--uninstall", action="store_true", help="Remove the service")
     args = parser.parse_args()
