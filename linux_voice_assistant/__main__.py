@@ -421,13 +421,13 @@ async def main() -> None:
     )
 
     # Sounds
-    parser.add_argument("--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac"))
+    parser.add_argument("--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.wav"))
     parser.add_argument(
         "--thinking-sound",
         default=str(_SOUNDS_DIR / "processing.wav"),
         help="Short sound to play while assistant is processing (thinking)",
     )
-    parser.add_argument("--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac"))
+    parser.add_argument("--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.wav"))
 
     # Event sockets for external services (LED controller, etc.)
     parser.add_argument(
