@@ -613,13 +613,13 @@ class VoiceSatelliteProtocol(APIServer):
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self.duck()
 
-        # Emit wake event immediately (don't wait for HA's STT_START event)
-        emit_event(self.state, "wake")
-
         try:
             self.state.tts_player.play(self.state.wakeup_sound)
         except Exception:
             _LOGGER.exception("Failed to play wakeup sound")
+
+        # Emit wake event immediately (don't wait for HA's STT_START event)
+        emit_event(self.state, "wake")
 
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
