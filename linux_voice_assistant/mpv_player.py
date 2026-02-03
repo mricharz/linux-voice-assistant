@@ -18,6 +18,8 @@ class MpvMediaPlayer:
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
+            audio_device_keep_open="yes",  # Keep device primed to avoid reconnect latency
+            audio_stream_silence="yes",  # Feed silence while idle so device never suspends
         )
 
         if device:

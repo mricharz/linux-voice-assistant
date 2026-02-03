@@ -607,24 +607,53 @@ class VoiceSatelliteProtocol(APIServer):
         if self.state.muted:
             return
 
+        self._block_wake_words = True
+        self._is_streaming_audio = False
+        self._pipeline_active = False
+        self._run_started_at = None
+        self._speech_end_handled = False
+
+        wake_word_phrase = wake_word.wake_word
+        _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
+
+        self.duck()
+
+        wakeup_sound = getattr(self.state, "wakeup_sound", "") or ""
+        if wakeup_sound:
+            def _finished_playing() -> None:
+                loop = self._loop
+                if loop is not None:
+                    loop.call_soon_threadsafe(
+                        lambda: self._start_pipeline_run(wake_word_phrase=wake_word_phrase)
+                    )
+                else:
+                    self._start_pipeline_run(wake_word_phrase=wake_word_phrase)
+
+            try:
+                self.state.tts_player.play(
+                    wakeup_sound,
+                    done_callback=_finished_playing,
+                )
+                _LOGGER.debug("Waiting for wakeup sound to finish before streaming audio")
+                return
+            except Exception:
+                _LOGGER.exception("Failed to play wakeup sound")
+
+        self._start_pipeline_run(wake_word_phrase=wake_word_phrase)
+
+    def _start_pipeline_run(self, wake_word_phrase: Optional[str] = None) -> None:
+        """Start microphone streaming and notify HA/LEDs once wake sound is done."""
+        request = VoiceAssistantRequest(start=True)
+        if wake_word_phrase:
+            request.wake_word_phrase = wake_word_phrase
+
         self._pipeline_active = True
         self._block_wake_words = True
         self._is_streaming_audio = True
         self._run_started_at = time.monotonic()
         self._speech_end_handled = False
 
-        wake_word_phrase = wake_word.wake_word
-        _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
-
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
-        self.duck()
-
-        try:
-            self.state.tts_player.play(self.state.wakeup_sound)
-        except Exception:
-            _LOGGER.exception("Failed to play wakeup sound")
-
-        # Emit wake event immediately (don't wait for HA's STT_START event)
+        self.send_messages([request])
         emit_event(self.state, "wake")
 
     def stop(self) -> None:
@@ -679,13 +708,7 @@ class VoiceSatelliteProtocol(APIServer):
         self.send_messages([VoiceAssistantAnnounceFinished()])
 
         if self._continue_conversation:
-            self.send_messages([VoiceAssistantRequest(start=True)])
-            self._pipeline_active = True
-            self._block_wake_words = True
-            self._is_streaming_audio = True
-            self._run_started_at = time.monotonic()
-            self._speech_end_handled = False
-            emit_event(self.state, "wake")  # Signal listening again
+            self._start_pipeline_run()
             _LOGGER.debug("Continuing conversation")
         else:
             self._block_wake_words = True
