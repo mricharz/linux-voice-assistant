@@ -3,13 +3,13 @@
   "wake_word": "Jarvis (DE)",
   "author": "Manuel Richarz",
   "website": "https://gitlab.com/richarz/custom_micro_wake_words",
-  "model": "jarvis_de_v2.tflite",
+  "model": "jarvis_de.tflite",
   "trained_languages": [
     "de"
   ],
   "version": 1,
   "micro": {
-    "probability_cutoff": 0.80,
+    "probability_cutoff": 0.99,
     "feature_step_size": 10,
     "sliding_window_size": 3,
     "tensor_arena_size": 22860,
