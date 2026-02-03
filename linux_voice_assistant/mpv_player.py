@@ -18,9 +18,16 @@ class MpvMediaPlayer:
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
-            audio_device_keep_open="yes",  # Keep device primed to avoid reconnect latency
-            audio_stream_silence="yes",  # Feed silence while idle so device never suspends
         )
+
+        for option, value in (
+                ("audio-device-keep-open", "yes"),
+                ("audio-stream-silence", "yes"),
+        ):
+            try:
+                self.player[option] = value
+            except AttributeError:
+                _LOGGER.debug("mpv option '%s' unavailable; continuing without it", option)
 
         if device:
             self.player["audio-device"] = device
