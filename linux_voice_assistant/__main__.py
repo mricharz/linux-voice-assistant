@@ -376,8 +376,8 @@ async def main() -> None:
     parser.add_argument(
         "--wakeword-threshold",
         type=float,
-        default=0.5,
-        help="Probability threshold (0-1) for wake word activation",
+        default=None,
+        help="Probability threshold (0-1) for wake word activation. If not set, uses saved preference or model default.",
     )
 
     # VAD mode
@@ -543,14 +543,34 @@ async def main() -> None:
         wake_models[wake_word_id] = wake_word.load()
         active_wake_words.add(wake_word_id)
 
+    # Determine wakeword_threshold: CLI > Preferences > Model default
+    wakeword_threshold: float
+    if args.wakeword_threshold is not None:
+        # CLI argument takes priority
+        wakeword_threshold = args.wakeword_threshold
+        _LOGGER.debug("Using wakeword_threshold from CLI: %.2f", wakeword_threshold)
+    elif preferences.wakeword_threshold is not None:
+        # Saved preference
+        wakeword_threshold = preferences.wakeword_threshold
+        _LOGGER.debug("Using wakeword_threshold from preferences: %.2f", wakeword_threshold)
+    else:
+        # Get from first loaded model (MicroWakeWord has probability_cutoff, OpenWakeWord defaults to 0.8)
+        first_model = next(iter(wake_models.values()), None)
+        if first_model is not None and isinstance(first_model, MicroWakeWord):
+            wakeword_threshold = first_model.probability_cutoff
+            _LOGGER.debug("Using wakeword_threshold from model: %.2f", wakeword_threshold)
+        else:
+            wakeword_threshold = 0.8  # Default for OpenWakeWord
+            _LOGGER.debug("Using default wakeword_threshold: %.2f", wakeword_threshold)
+
     # Apply wakeword_threshold to all loaded MicroWakeWord models
     for model_id, model in wake_models.items():
         if isinstance(model, MicroWakeWord):
-            model.probability_cutoff = args.wakeword_threshold
+            model.probability_cutoff = wakeword_threshold
             _LOGGER.debug(
                 "Set MicroWakeWord '%s' probability_cutoff to %.2f",
                 model_id,
-                args.wakeword_threshold,
+                wakeword_threshold,
             )
 
     stop_model: Optional[MicroWakeWord] = None
@@ -585,7 +605,7 @@ async def main() -> None:
         preferences=preferences,
         preferences_path=preferences_path,
         refractory_seconds=args.refractory_seconds,
-        wakeword_threshold=args.wakeword_threshold,
+        wakeword_threshold=wakeword_threshold,
         va_mode=va_mode,
         local_vad_aggressiveness=args.local_vad_aggressiveness,
         local_vad_frame_ms=args.local_vad_frame_ms,
@@ -606,8 +626,9 @@ async def main() -> None:
     state.music_player.set_volume(initial_volume)
     state.tts_player.set_volume(initial_volume)
 
-    # Save resolved mode back to preferences (so it matches dropdown default on first connect)
+    # Save resolved settings back to preferences
     state.preferences.va_mode = state.va_mode
+    state.preferences.wakeword_threshold = state.wakeword_threshold
     try:
         state.save_preferences()
     except Exception:

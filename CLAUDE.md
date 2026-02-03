@@ -64,6 +64,7 @@ MpvMediaPlayer → Speaker
 | `models.py` | ServerState, Preferences, AvailableWakeWord |
 | `mpv_player.py` | Audio playback with ducking support |
 | `local_vad.py` | WebRTC VAD state machine |
+| `util.py` | Helpers: `emit_event()`, `create_event_sockets()` |
 
 ### Entity System
 
@@ -84,6 +85,20 @@ ESPHome entities exposed to Home Assistant:
 
 Stored in `preferences.json`: active wake words, VAD mode, volume. Auto-loaded on startup.
 
+### Event System
+
+External services can subscribe to voice events via Unix datagram sockets (`--event-socket`):
+- Events: `ready`, `muted`, `wake`, `stt_end`, `intent_start`, `speak`, `idle`, `stop`, `timer_started`, `timer_finished`, `error`
+- Non-blocking emission (~0.1ms) via `emit_event()` in `util.py`
+- Used by LED controller addon (`addons/ledservice/`)
+
+### Addons
+
+Located in `addons/` directory:
+- **ledservice**: APA102 LED controller via SPI, listens on event socket
+  - Install: `sudo python3 addons/ledservice/setup`
+  - Creates own venv, registers systemd service `lva-led`
+
 ## Key Patterns
 
 - Audio queue bounded (maxsize=8), drops oldest on overflow for low latency
@@ -91,3 +106,4 @@ Stored in `preferences.json`: active wake words, VAD mode, volume. Auto-loaded o
 - `_speech_end_handled` flag prevents double VAD_END/STT_END processing
 - `_pipeline_active` blocks wake words during active runs
 - Audio normalization: in-place numpy ops, NaN→0, clip [-1,1], convert to s16le
+- Event sockets use `SOCK_DGRAM` for fire-and-forget, non-blocking sends

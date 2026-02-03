@@ -60,6 +60,9 @@ class Preferences:
     # Output volume (0-100%)
     volume: int = 100
 
+    # Wakeword threshold (0-1), None means use model default
+    wakeword_threshold: Optional[float] = None
+
 
 @dataclass
 class ServerState:

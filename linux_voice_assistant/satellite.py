@@ -275,6 +275,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         _LOGGER.info("Wakeword threshold set to: %.2f", threshold)
         self.state.wakeword_threshold = threshold
+        self.state.preferences.wakeword_threshold = threshold
 
         # Also update threshold on all loaded MicroWakeWord models
         for wake_word in self.state.wake_words.values():
@@ -285,6 +286,11 @@ class VoiceSatelliteProtocol(APIServer):
                     wake_word.id,
                     threshold,
                 )
+
+        try:
+            self.state.save_preferences()
+        except Exception:
+            _LOGGER.exception("Failed to save preferences after threshold change")
 
     def set_volume(self, new_volume: float) -> None:
         """Update output volume (called from HA number entity)."""
