@@ -1,6 +1,7 @@
 # Linux Voice Assistant
 
-Experimental Linux voice assistant for [Home Assistant][homeassistant] that uses the [ESPHome][esphome] protocol.
+Extended Linux voice assistant for [Home Assistant][homeassistant] that uses the [ESPHome][esphome] protocol.
+This is based on the experimental [linux-voice-assistant][linux-voice-assistant].
 
 Runs on Linux `aarch64` and `x86_64` platforms. Tested with Python 3.13 and Python 3.11.
 Supports announcments, start/continue conversation, and timers.
@@ -16,7 +17,7 @@ Install system dependencies (`apt-get`):
 Clone and install project:
 
 ``` sh
-git clone https://github.com/richarz/linux-voice-assistant.git
+git clone https://github.com/mricharz/linux-voice-assistant.git
 cd linux-voice-assistant
 script/setup
 ```
@@ -260,6 +261,7 @@ python3 -m linux_voice_assistant ... \
 ```
 
 <!-- Links -->
+[linux-voice-assistant]: https://github.com/OHF-Voice/linux-voice-assistant
 [homeassistant]: https://www.home-assistant.io/
 [esphome]: https://esphome.io/
 [microWakeWord]: https://github.com/kahrendt/microWakeWord

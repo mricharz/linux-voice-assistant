@@ -3,13 +3,14 @@ requires = ["setuptools>=62.3,<81"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name        = "linux-voice-assistant"
+name        = "extended-linux--voice-assistant"
 version     = "1.0.0"
 license     = {text = "Apache-2.0"}
-description = "Linux voice assistant for Home Assistant using the ESPHome protocol"
+description = "Extended linux voice assistant for Home Assistant using the ESPHome protocol"
 readme      = "README.md"
 authors     = [
-    {name = "The Home Assistant Authors", email = "hello@home-assistant.io"}
+    {name = "The Home Assistant Authors", email = "hello@home-assistant.io"},
+    {name = "Manuel Richarz", email = "manuel.richarz@nysoft.de"}
 ]
 keywords    = ["home", "assistant", "voice", "esphome", "linux"]
 classifiers = [
@@ -45,7 +46,7 @@ dev = [
 ]
 
 [project.urls]
-"Source Code" = "http://github.com/OHF-Voice/linux-voice-assistant"
+"Source Code" = "http://github.com/mricharz/linux-voice-assistant"
 
 [tool.setuptools]
 platforms = ["any"]
