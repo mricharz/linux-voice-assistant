@@ -633,6 +633,7 @@ class VoiceSatelliteProtocol(APIServer):
                 self.state.tts_player.play(
                     wakeup_sound,
                     done_callback=_finished_playing,
+                    stop_first=True,
                 )
                 _LOGGER.debug("Waiting for wakeup sound to finish before streaming audio")
                 return
