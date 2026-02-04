@@ -20,10 +20,6 @@ class MpvMediaPlayer:
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
-            keep_open="always",
-            keep_open_pause="no",
-            idle="yes",
-            prefetch_playlist="yes",
         )
 
         self._set_option_if_supported("audio-device-keep-open", "yes")
@@ -41,12 +37,9 @@ class MpvMediaPlayer:
 
         self._duck_volume: int = 50
         self._unduck_volume: int = 100
-        self._idle_source = "lavfi://anullsrc"
-        self._idle_active = False
         self._preloaded_files: Set[str] = set()
 
         self.player.event_callback("end-file")(self._on_end_file)
-        self._start_idle_playback()
 
     def play(
         self,
@@ -55,7 +48,7 @@ class MpvMediaPlayer:
         stop_first: bool = True,
     ) -> None:
         if stop_first:
-            self.stop(restart_idle=False)
+            self.stop()
 
         if isinstance(url, str):
             self._playlist = [url]
@@ -87,14 +80,11 @@ class MpvMediaPlayer:
         else:
             self.is_playing = False
 
-    def stop(self, restart_idle: bool = True) -> None:
+    def stop(self) -> None:
         self.player.stop()
         self._playlist.clear()
         self.is_playing = False
         self.is_paused = False
-        self._idle_active = False
-        if restart_idle:
-            self._start_idle_playback()
 
     def duck(self) -> None:
         self.player.volume = self._duck_volume
@@ -157,7 +147,6 @@ class MpvMediaPlayer:
 
         self.is_playing = False
         self.is_paused = False
-        self._idle_active = False
 
         todo_callback: Optional[Callable[[], None]] = None
         with self._done_callback_lock:
@@ -170,19 +159,3 @@ class MpvMediaPlayer:
                 todo_callback()
             except Exception:
                 _LOGGER.exception("Unexpected error running done callback")
-
-        self._start_idle_playback()
-
-    def _start_idle_playback(self) -> None:
-        if self._idle_active:
-            return
-
-        try:
-            self.player.play(self._idle_source)
-            self._idle_active = True
-            # Present idle as "not playing" to consumers.
-            self.is_playing = False
-            self.is_paused = False
-        except Exception:
-            self._idle_active = False
-            _LOGGER.debug("Failed to start idle playback", exc_info=True)
