@@ -20,14 +20,8 @@ class MpvMediaPlayer:
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
         )
 
-        for option, value in (
-                ("audio-device-keep-open", "yes"),
-                ("audio-stream-silence", "yes"),
-        ):
-            try:
-                self.player[option] = value
-            except AttributeError:
-                _LOGGER.debug("mpv option '%s' unavailable; continuing without it", option)
+        self._set_option_if_supported("audio-device-keep-open", "yes")
+        self._set_option_if_supported("audio-stream-silence", "yes")
 
         if device:
             self.player["audio-device"] = device
@@ -100,6 +94,27 @@ class MpvMediaPlayer:
 
         self._unduck_volume = volume
         self._duck_volume = volume // 2
+
+    def _set_option_if_supported(self, option: str, value: str) -> None:
+        """Best-effort helper to apply mpv options only if supported by the runtime."""
+        option_info = getattr(self.player, "option_info", None)
+        if option_info is None:
+            return
+
+        try:
+            info = option_info(option)
+        except Exception:
+            _LOGGER.debug("Unable to query mpv option '%s'", option, exc_info=True)
+            return
+
+        if info is None:
+            _LOGGER.debug("mpv option '%s' unavailable; skipping", option)
+            return
+
+        try:
+            self.player[option] = value
+        except Exception:
+            _LOGGER.debug("Unable to set mpv option '%s'", option, exc_info=True)
 
     def _on_end_file(self, event) -> None:
         if self._playlist:
