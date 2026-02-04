@@ -626,6 +626,14 @@ async def main() -> None:
     state.music_player.set_volume(initial_volume)
     state.tts_player.set_volume(initial_volume)
 
+    for sound_path in (
+            state.wakeup_sound,
+            state.timer_finished_sound,
+            state.thinking_sound,
+    ):
+        if sound_path:
+            state.tts_player.preload(sound_path)
+
     # Save resolved settings back to preferences
     state.preferences.va_mode = state.va_mode
     state.preferences.wakeword_threshold = state.wakeword_threshold
