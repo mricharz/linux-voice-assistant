@@ -25,10 +25,13 @@ class HomeAssistantZeroconf:
 
         if not host:
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            test_sock.setblocking(False)
-            test_sock.connect((MDNS_TARGET_IP, 1))
-            host = test_sock.getsockname()[0]
-            _LOGGER.debug("Detected IP: %s", host)
+            try:
+                test_sock.setblocking(False)
+                test_sock.connect((MDNS_TARGET_IP, 1))
+                host = test_sock.getsockname()[0]
+                _LOGGER.debug("Detected IP: %s", host)
+            finally:
+                test_sock.close()
 
         assert host
         self.host = host

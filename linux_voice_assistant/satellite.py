@@ -680,10 +680,14 @@ class VoiceSatelliteProtocol(APIServer):
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
     def duck(self) -> None:
+        if self.state.music_player is self.state.tts_player:
+            return
         _LOGGER.debug("Ducking music")
         self.state.music_player.duck()
 
     def unduck(self) -> None:
+        if self.state.music_player is self.state.tts_player:
+            return
         _LOGGER.debug("Unducking music")
         self.state.music_player.unduck()
 

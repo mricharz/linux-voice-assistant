@@ -140,6 +140,13 @@ class MpvMediaPlayer:
         except Exception:
             _LOGGER.debug("Unable to set mpv option '%s'", option, exc_info=True)
 
+    def terminate(self) -> None:
+        """Release mpv resources and stop the underlying process."""
+        try:
+            self.player.terminate()
+        except Exception:
+            _LOGGER.debug("Error terminating mpv player", exc_info=True)
+
     def _on_end_file(self, event) -> None:
         if self._playlist:
             self.player.play(self._playlist.pop(0))

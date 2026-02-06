@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -334,6 +335,21 @@ def process_audio(
 
 # -----------------------------------------------------------------------------
 
+
+async def _reap_zombies() -> None:
+    """Periodically reap zombie child processes spawned by native libraries (libmpv)."""
+    while True:
+        await asyncio.sleep(30)
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                _LOGGER.debug("Reaped zombie child process: %d", pid)
+            except ChildProcessError:
+                break
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--name")
@@ -618,13 +634,13 @@ async def main() -> None:
     # NOTE: Mpv players are created in satellite constructor in your current repo layout.
     # If your ServerState requires them here, re-add MpvMediaPlayer imports/creation.
     from .mpv_player import MpvMediaPlayer
-    state.music_player = MpvMediaPlayer(device=args.audio_output_device)
-    state.tts_player = MpvMediaPlayer(device=args.audio_output_device)
+    player = MpvMediaPlayer(device=args.audio_output_device)
+    state.music_player = player
+    state.tts_player = player
 
-    # Apply saved volume to players
+    # Apply saved volume
     initial_volume = state.preferences.volume
-    state.music_player.set_volume(initial_volume)
-    state.tts_player.set_volume(initial_volume)
+    player.set_volume(initial_volume)
 
     for sound_path in (
             state.wakeup_sound,
@@ -665,6 +681,8 @@ async def main() -> None:
     discovery = HomeAssistantZeroconf(port=args.port, name=args.name)
     await discovery.register_server()
 
+    reaper_task = asyncio.ensure_future(_reap_zombies())
+
     try:
         async with server:
             _LOGGER.info("Server started (host=%s, port=%s)", args.host, args.port)
@@ -672,7 +690,9 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        # stop sender thread cleanly
+        reaper_task.cancel()
+
+        # Stop sender thread cleanly
         try:
             state.audio_queue.put_nowait(None)
         except Full:
@@ -684,8 +704,18 @@ async def main() -> None:
                 state.audio_queue.put_nowait(None)
             except Full:
                 pass
-
         sender_thread.join(timeout=2.0)
+
+        # Terminate mpv player
+        player.terminate()
+
+        # Close event sockets
+        for sock, _path in state.event_sockets:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
         _LOGGER.debug("Server stopped")
 
 
