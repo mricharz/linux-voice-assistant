@@ -46,6 +46,7 @@ class MpvMediaPlayer:
         url: Union[str, List[str]],
         done_callback: Optional[Callable[[], None]] = None,
         stop_first: bool = True,
+        volume_offset: int = 0,
     ) -> None:
         if stop_first:
             self.stop()
@@ -58,7 +59,19 @@ class MpvMediaPlayer:
         next_url = self._playlist.pop(0)
         _LOGGER.debug("Playing %s", next_url)
 
-        self._done_callback = done_callback
+        if volume_offset:
+            self.player.volume = max(0, min(100, self._unduck_volume + volume_offset))
+            original_callback = done_callback
+
+            def _restore_volume() -> None:
+                self.player.volume = self._unduck_volume
+                if original_callback:
+                    original_callback()
+
+            self._done_callback = _restore_volume
+        else:
+            self._done_callback = done_callback
+
         self.is_playing = True
         self.is_paused = False
         # Ensure playback starts even if the player was previously paused.

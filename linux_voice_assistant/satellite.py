@@ -634,6 +634,7 @@ class VoiceSatelliteProtocol(APIServer):
                     wakeup_sound,
                     done_callback=_finished_playing,
                     stop_first=True,
+                    volume_offset=-5,
                 )
                 _LOGGER.debug("Waiting for wakeup sound to finish before streaming audio")
                 return
@@ -704,7 +705,7 @@ class VoiceSatelliteProtocol(APIServer):
             if not path.is_file():
                 return
             self._thinking_played = True
-            self.state.tts_player.play(str(path))
+            self.state.tts_player.play(str(path), volume_offset=-5)
         except Exception:
             _LOGGER.exception("Failed to play thinking sound")
 

@@ -109,6 +109,8 @@ This is useful for LED rings, beeps, or external scripts.
 - `--thinking-sound <FILE>`: Short sound while assistant is processing
 - `--timer-finished-sound <FILE>`: Played when a timer ends
 
+Wake and thinking sounds are automatically played 5% quieter than the configured volume to feel less intrusive.
+
 Example:
 
 ```python3 -m linux_voice_assistant ... \
