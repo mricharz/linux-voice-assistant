@@ -70,6 +70,10 @@ def install(socket_path: str, n: int, brightness: int, pulse_user: str = None):
         print(f"Error: {_LED_SERVICE} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Stop running service before recreating venv (avoids "Text file busy")
+    subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     venv_python = setup_venv()
 
     # Detect PulseAudio user: explicit --user, or the user who ran sudo
