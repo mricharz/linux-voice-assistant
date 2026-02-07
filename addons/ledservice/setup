@@ -51,17 +51,34 @@ def setup_venv():
     return context.env_exe
 
 
-def get_pulse_server(user: str) -> str:
-    """Detect PulseAudio socket path for the given user."""
+def get_pulse_env(user: str) -> dict:
+    """Detect PulseAudio server and cookie paths for the given user."""
     try:
         uid = subprocess.check_output(["id", "-u", user], text=True).strip()
-        pulse_path = f"unix:/run/user/{uid}/pulse/native"
-        print(f"PulseAudio server for '{user}' (uid {uid}): {pulse_path}")
-        return pulse_path
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print(f"Warning: could not determine UID for user '{user}', "
+        home = subprocess.check_output(["getent", "passwd", user], text=True).strip().split(":")[5]
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
+        print(f"Warning: could not determine UID/home for user '{user}', "
               "audio VU meter may not work", file=sys.stderr)
-        return None
+        return {}
+
+    server = f"unix:/run/user/{uid}/pulse/native"
+
+    # Cookie can be in different locations
+    cookie = None
+    for candidate in [
+        f"{home}/.config/pulse/cookie",
+        f"{home}/.pulse-cookie",
+    ]:
+        if Path(candidate).exists():
+            cookie = candidate
+            break
+
+    result = {"PULSE_SERVER": server}
+    if cookie:
+        result["PULSE_COOKIE"] = cookie
+
+    print(f"PulseAudio env for '{user}' (uid {uid}): {result}")
+    return result
 
 
 def install(socket_path: str, n: int, brightness: int, pulse_user: str = None):
@@ -83,14 +100,14 @@ def install(socket_path: str, n: int, brightness: int, pulse_user: str = None):
         print("Warning: could not detect PulseAudio user (no --user, no SUDO_USER), "
               "audio VU meter may not work", file=sys.stderr)
 
-    # Build optional PulseAudio environment line
-    env_line = ""
+    # Build optional PulseAudio environment lines
+    env_lines = []
     if pulse_user:
-        pulse_server = get_pulse_server(pulse_user)
-        if pulse_server:
-            env_line = f"Environment=PULSE_SERVER={pulse_server}"
+        pulse_env = get_pulse_env(pulse_user)
+        for key, val in pulse_env.items():
+            env_lines.append(f"Environment={key}={val}")
 
-    env_section = f"\n{env_line}" if env_line else ""
+    env_section = "\n" + "\n".join(env_lines) if env_lines else ""
     service_content = f"""[Unit]
 Description=LED Service for Linux Voice Assistant
 After=network.target
