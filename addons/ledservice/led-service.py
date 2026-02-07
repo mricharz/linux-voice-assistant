@@ -122,16 +122,37 @@ class AudioMonitor:
         except OSError:
             raise RuntimeError("libpulse-simple not found")
 
+        # Define function signatures to avoid segfaults on aarch64
+        self._lib.pa_simple_new.argtypes = [
+            ctypes.c_char_p,                    # server
+            ctypes.c_char_p,                    # name
+            ctypes.c_int,                       # dir
+            ctypes.c_char_p,                    # dev
+            ctypes.c_char_p,                    # stream_name
+            ctypes.POINTER(self._PaSampleSpec), # sample_spec
+            ctypes.c_void_p,                    # channel_map
+            ctypes.c_void_p,                    # buffer_attr
+            ctypes.POINTER(ctypes.c_int),       # error
+        ]
+        self._lib.pa_simple_new.restype = ctypes.c_void_p
+
+        self._lib.pa_simple_read.argtypes = [
+            ctypes.c_void_p,                    # s
+            ctypes.c_void_p,                    # data
+            ctypes.c_size_t,                    # bytes
+            ctypes.POINTER(ctypes.c_int),       # error
+        ]
+        self._lib.pa_simple_read.restype = ctypes.c_int
+
+        self._lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+        self._lib.pa_simple_free.restype = None
+
         spec = self._PaSampleSpec()
         spec.format = self.PA_SAMPLE_S16LE
         spec.rate = rate
         spec.channels = 1
 
         error = ctypes.c_int(0)
-
-        # pa_simple* pa_simple_new(server, name, dir, dev, stream_name,
-        #                          sample_spec, channel_map, attr, error)
-        self._lib.pa_simple_new.restype = ctypes.c_void_p
         self._stream = self._lib.pa_simple_new(
             None,                                        # server (default)
             b"lva-led-vu",                               # app name
@@ -146,14 +167,12 @@ class AudioMonitor:
         if not self._stream:
             raise RuntimeError(f"pa_simple_new failed (error={error.value})")
 
-        self._lib.pa_simple_read.restype = ctypes.c_int
-        self._lib.pa_simple_free.restype = None
-
     def read_level(self) -> float:
         """Read a chunk and return RMS level as 0.0-1.0. Returns None on error."""
         error = ctypes.c_int(0)
         ret = self._lib.pa_simple_read(
-            self._stream, self._buf, len(self._buf), ctypes.byref(error)
+            self._stream, self._buf, ctypes.c_size_t(len(self._buf)),
+            ctypes.byref(error),
         )
         if ret < 0:
             return None
