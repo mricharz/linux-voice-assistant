@@ -8,6 +8,7 @@ Options:
     --socket PATH       Socket path (default: /run/lva/led.sock)
     --n NUM             Number of LEDs (default: 12)
     --brightness NUM    LED brightness 0-31 (default: 8)
+    --user NAME         System user running PulseAudio (for audio VU meter)
     --uninstall         Remove the service
 """
 
@@ -50,7 +51,20 @@ def setup_venv():
     return context.env_exe
 
 
-def install(socket_path: str, n: int, brightness: int):
+def get_pulse_server(user: str) -> str:
+    """Detect PulseAudio socket path for the given user."""
+    try:
+        uid = subprocess.check_output(["id", "-u", user], text=True).strip()
+        pulse_path = f"unix:/run/user/{uid}/pulse/native"
+        print(f"PulseAudio server for '{user}' (uid {uid}): {pulse_path}")
+        return pulse_path
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"Warning: could not determine UID for user '{user}', "
+              "audio VU meter may not work", file=sys.stderr)
+        return None
+
+
+def install(socket_path: str, n: int, brightness: int, pulse_user: str = None):
     """Install the LED service."""
     if not _LED_SERVICE.exists():
         print(f"Error: {_LED_SERVICE} not found", file=sys.stderr)
@@ -58,6 +72,21 @@ def install(socket_path: str, n: int, brightness: int):
 
     venv_python = setup_venv()
 
+    # Detect PulseAudio user: explicit --user, or the user who ran sudo
+    if not pulse_user:
+        pulse_user = os.environ.get("SUDO_USER")
+    if not pulse_user:
+        print("Warning: could not detect PulseAudio user (no --user, no SUDO_USER), "
+              "audio VU meter may not work", file=sys.stderr)
+
+    # Build optional PulseAudio environment line
+    env_line = ""
+    if pulse_user:
+        pulse_server = get_pulse_server(pulse_user)
+        if pulse_server:
+            env_line = f"Environment=PULSE_SERVER={pulse_server}"
+
+    env_section = f"\n{env_line}" if env_line else ""
     service_content = f"""[Unit]
 Description=LED Service for Linux Voice Assistant
 After=network.target
@@ -65,7 +94,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory={_DIR}
+WorkingDirectory={_DIR}{env_section}
 ExecStartPre=/bin/mkdir -p {Path(socket_path).parent}
 ExecStart={venv_python} {_LED_SERVICE} {socket_path} --n {n} --brightness {brightness}
 Restart=always
@@ -113,6 +142,8 @@ def main():
     parser.add_argument("--socket", default="/run/lva/led.sock", help="Socket path")
     parser.add_argument("--n", type=int, default=3, help="Number of LEDs")
     parser.add_argument("--brightness", type=int, default=8, help="LED brightness 0-31")
+    parser.add_argument("--user", default=None,
+                        help="System user running PulseAudio (e.g. hass) for audio VU meter")
     parser.add_argument("--uninstall", action="store_true", help="Remove the service")
     args = parser.parse_args()
 
@@ -121,7 +152,7 @@ def main():
     if args.uninstall:
         uninstall()
     else:
-        install(args.socket, args.n, args.brightness)
+        install(args.socket, args.n, args.brightness, args.user)
 
 
 if __name__ == "__main__":

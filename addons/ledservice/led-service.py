@@ -18,11 +18,14 @@ Events:
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import math
 import os
 import random
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
@@ -61,6 +64,25 @@ class APA102LEDs:
         data = self._start_frame + led * self.n + self._end_frame
         self.spi.xfer2(data)
 
+    def write_pixels(self, pixels: list):
+        """Write individual color/brightness per LED.
+
+        Args:
+            pixels: list of (r, g, b, brightness) tuples, one per LED.
+        """
+        data = list(self._start_frame)
+        for r, g, b, bri in pixels:
+            bri = max(0, min(31, int(bri)))
+            r = max(0, min(255, int(r)))
+            g = max(0, min(255, int(g)))
+            b = max(0, min(255, int(b)))
+            data.extend([0xE0 | bri, b, g, r])
+        # Pad if fewer pixels than n
+        for _ in range(self.n - len(pixels)):
+            data.extend([0xE0, 0, 0, 0])
+        data.extend(self._end_frame)
+        self.spi.xfer2(data)
+
     def off(self):
         """Turn off all LEDs."""
         self.write((0, 0, 0), 0)
@@ -69,6 +91,87 @@ class APA102LEDs:
         """Close SPI connection."""
         self.off()
         self.spi.close()
+
+
+class AudioMonitor:
+    """Monitor PulseAudio output via the Simple API (ctypes, no pip deps)."""
+
+    # PulseAudio sample format constants
+    PA_SAMPLE_S16LE = 3
+    PA_STREAM_RECORD = 2
+
+    # pa_sample_spec struct: format(uint32), rate(uint32), channels(uint8)
+    class _PaSampleSpec(ctypes.Structure):
+        _fields_ = [
+            ("format", ctypes.c_uint32),
+            ("rate", ctypes.c_uint32),
+            ("channels", ctypes.c_uint8),
+        ]
+
+    def __init__(self, rate: int = 16000, chunk_samples: int = 512):
+        self._lib = None
+        self._stream = None
+        self._chunk_samples = chunk_samples
+        self._buf = ctypes.create_string_buffer(chunk_samples * 2)  # s16le = 2 bytes
+
+        lib_path = ctypes.util.find_library("pulse-simple")
+        if not lib_path:
+            lib_path = "libpulse-simple.so.0"
+        try:
+            self._lib = ctypes.CDLL(lib_path)
+        except OSError:
+            raise RuntimeError("libpulse-simple not found")
+
+        spec = self._PaSampleSpec()
+        spec.format = self.PA_SAMPLE_S16LE
+        spec.rate = rate
+        spec.channels = 1
+
+        error = ctypes.c_int(0)
+
+        # pa_simple* pa_simple_new(server, name, dir, dev, stream_name,
+        #                          sample_spec, channel_map, attr, error)
+        self._lib.pa_simple_new.restype = ctypes.c_void_p
+        self._stream = self._lib.pa_simple_new(
+            None,                                        # server (default)
+            b"lva-led-vu",                               # app name
+            self.PA_STREAM_RECORD,                       # direction
+            b"@DEFAULT_MONITOR@",                        # device
+            b"vu-meter",                                 # stream name
+            ctypes.byref(spec),                          # sample spec
+            None,                                        # channel map
+            None,                                        # buffer attr
+            ctypes.byref(error),                         # error
+        )
+        if not self._stream:
+            raise RuntimeError(f"pa_simple_new failed (error={error.value})")
+
+        self._lib.pa_simple_read.restype = ctypes.c_int
+        self._lib.pa_simple_free.restype = None
+
+    def read_level(self) -> float:
+        """Read a chunk and return RMS level as 0.0-1.0. Returns None on error."""
+        error = ctypes.c_int(0)
+        ret = self._lib.pa_simple_read(
+            self._stream, self._buf, len(self._buf), ctypes.byref(error)
+        )
+        if ret < 0:
+            return None
+
+        # Decode s16le samples and compute RMS
+        samples = struct.unpack(f"<{self._chunk_samples}h", self._buf.raw)
+        sum_sq = 0.0
+        for s in samples:
+            sum_sq += s * s
+        rms = math.sqrt(sum_sq / self._chunk_samples)
+        # Normalize: s16le max is 32767
+        return min(1.0, rms / 32767.0 * 4.0)  # x4 gain for typical speech levels
+
+    def close(self):
+        """Free the PulseAudio stream."""
+        if self._stream and self._lib:
+            self._lib.pa_simple_free(self._stream)
+            self._stream = None
 
 
 class LEDController:
@@ -116,8 +219,8 @@ class LEDController:
                 self._run_animation(self._blink_green)
 
             elif event == "speak":
-                # Blue VU-meter style animation (speaking)
-                self._run_animation(self._vu_meter_blue)
+                # Real audio-driven VU meter, fallback to fake
+                self._run_animation(self._vu_meter_real)
 
             elif event == "muted":
                 # Dim orange at 50% brightness
@@ -153,10 +256,10 @@ class LEDController:
             if self._stop_event.is_set():
                 break
             self.leds.write((255, 0, 0))
-            if self._stop_event.wait(0.12):
+            if self._stop_event.wait(0.20):
                 break
             self.leds.off()
-            if self._stop_event.wait(0.10):
+            if self._stop_event.wait(0.16):
                 break
         self.leds.off()
 
@@ -166,10 +269,10 @@ class LEDController:
             if self._stop_event.is_set():
                 break
             self.leds.write((0, 255, 0))
-            if self._stop_event.wait(0.12):
+            if self._stop_event.wait(0.20):
                 break
             self.leds.off()
-            if self._stop_event.wait(0.10):
+            if self._stop_event.wait(0.16):
                 break
         self.leds.off()
 
@@ -226,6 +329,64 @@ class LEDController:
 
             if self._stop_event.wait(0.04):
                 break
+
+        self.leds.off()
+
+    def _vu_meter_real(self):
+        """Audio-driven VU meter with center-outward LED spread."""
+        try:
+            monitor = AudioMonitor()
+        except RuntimeError as e:
+            print(f"AudioMonitor unavailable ({e}), using fake VU", file=sys.stderr)
+            self._vu_meter_blue()
+            return
+
+        try:
+            n = self.leds.n
+            smoothed = 0.0
+            center = (n - 1) / 2.0  # fractional center
+
+            while not self._stop_event.is_set():
+                raw = monitor.read_level()
+                if raw is None:
+                    break
+
+                # Exponential smoothing
+                smoothed = smoothed * 0.7 + raw * 0.3
+
+                # Build per-LED pixel data
+                pixels = []
+                half = n / 2.0
+                spread = smoothed * half  # how many LEDs from center to light
+
+                for i in range(n):
+                    dist = abs(i - center)
+                    if spread < 0.01:
+                        # Silence - all off
+                        pixels.append((0, 0, 0, 0))
+                    elif dist <= spread:
+                        # LED is within the lit range
+                        # Intensity fades toward the edges
+                        if spread > 0:
+                            fade = 1.0 - (dist / max(spread, 0.01)) * 0.6
+                        else:
+                            fade = 1.0
+                        fade = max(0.0, min(1.0, fade))
+
+                        blue = int(255 * fade * smoothed)
+                        # Green tint at higher levels
+                        green = int(60 * fade * smoothed) if smoothed > 0.3 else 0
+                        bri = max(1, int(self.brightness * fade))
+                        pixels.append((0, green, blue, bri))
+                    else:
+                        pixels.append((0, 0, 0, 0))
+
+                self.leds.write_pixels(pixels)
+
+                if self._stop_event.wait(0.033):  # ~30fps
+                    break
+        finally:
+            monitor.close()
 
         self.leds.off()
 
