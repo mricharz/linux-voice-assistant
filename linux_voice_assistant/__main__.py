@@ -329,8 +329,7 @@ def process_audio(
                         break
 
     except Exception:
-        _LOGGER.exception("Unexpected error processing audio")
-        sys.exit(1)
+        _LOGGER.exception("Audio recording failed")
 
 
 # -----------------------------------------------------------------------------
@@ -660,9 +659,14 @@ async def main() -> None:
 
     loop = asyncio.get_running_loop()
 
+    def process_audio_loop() -> None:
+        while True:
+            process_audio(state, mic, args.audio_input_block_size, loop)
+            _LOGGER.info("Restarting audio processing in 3s...")
+            time.sleep(3)
+
     process_audio_thread = threading.Thread(
-        target=process_audio,
-        args=(state, mic, args.audio_input_block_size, loop),
+        target=process_audio_loop,
         daemon=True,
     )
     process_audio_thread.start()
