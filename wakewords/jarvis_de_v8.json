@@ -1,0 +1,18 @@
+{
+  "type": "micro",
+  "wake_word": "Jarvis (DE) v8",
+  "author": "Manuel Richarz",
+  "website": "https://gitlab.com/richarz/custom_micro_wake_words",
+  "model": "jarvis_de_v8.tflite",
+  "trained_languages": [
+    "de"
+  ],
+  "version": 1,
+  "micro": {
+    "probability_cutoff": 0.62,
+    "feature_step_size": 10,
+    "sliding_window_size": 3,
+    "tensor_arena_size": 22860,
+    "minimum_esphome_version": "2024.7.0"
+  }
+}
