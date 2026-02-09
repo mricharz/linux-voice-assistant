@@ -7,6 +7,8 @@ import os
 import sys
 import threading
 import time
+import wave
+from collections import deque
 from pathlib import Path
 from queue import Queue, Full, Empty
 from typing import Dict, List, Optional, Set, Union
@@ -118,6 +120,7 @@ def process_audio(
         mic,
         block_size: int,
         loop: asyncio.AbstractEventLoop,
+        save_wake_audio_dir: Optional[Path] = None,
 ) -> None:
     """Process audio chunks from the microphone.
 
@@ -141,6 +144,13 @@ def process_audio(
 
     last_active: Optional[float] = None
 
+    # Circular buffer for saving audio on wake word activation
+    audio_ring: Optional[deque] = None
+    if save_wake_audio_dir is not None:
+        save_wake_audio_dir.mkdir(parents=True, exist_ok=True)
+        ring_maxlen = 3 * 16000 // block_size  # ~3 seconds at 16kHz
+        audio_ring = deque(maxlen=ring_maxlen)
+
     # Local VAD (created lazily)
     local_vad: Optional[LocalWebRTCVAD] = None
     last_va_mode: Optional[str] = None
@@ -157,6 +167,9 @@ def process_audio(
                 np.clip(audio_chunk_array, -1.0, 1.0, out=audio_chunk_array)
 
                 audio_chunk = (audio_chunk_array * 32767.0).astype("<i2").tobytes()
+
+                if audio_ring is not None:
+                    audio_ring.append(audio_chunk)
 
                 sat = state.satellite
                 if sat is None:
@@ -323,6 +336,20 @@ def process_audio(
                             else:
                                 _LOGGER.info("Wake word activated: %s", wake_word.id)
 
+                            # Save audio buffer to WAV for debug/training
+                            if audio_ring is not None and len(audio_ring) > 0:
+                                try:
+                                    ts = time.strftime("%Y%m%d_%H%M%S")
+                                    wav_path = save_wake_audio_dir / f"{wake_word.id}_{ts}.wav"
+                                    with wave.open(str(wav_path), "wb") as wf:
+                                        wf.setnchannels(1)
+                                        wf.setsampwidth(2)
+                                        wf.setframerate(16000)
+                                        wf.writeframes(b"".join(audio_ring))
+                                    _LOGGER.info("Saved wake audio: %s", wav_path)
+                                except Exception:
+                                    _LOGGER.exception("Failed to save wake audio")
+
                             _schedule_sat_wakeup(loop, state, wake_word)
                             last_active = now
                         break
@@ -449,6 +476,12 @@ async def main() -> None:
         action="append",
         default=[],
         help="Unix socket path to send events to (can be specified multiple times)",
+    )
+
+    parser.add_argument(
+        "--save-wake-audio-dir",
+        default=None,
+        help="Directory to save audio snippets (~3s) on wake word activation (for debug/training)",
     )
 
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
@@ -674,11 +707,15 @@ async def main() -> None:
     except Exception:
         _LOGGER.exception("Failed to save preferences at startup")
 
+    save_wake_audio_dir: Optional[Path] = (
+        Path(args.save_wake_audio_dir) if args.save_wake_audio_dir else None
+    )
+
     loop = asyncio.get_running_loop()
 
     def process_audio_loop() -> None:
         while True:
-            process_audio(state, mic, args.audio_input_block_size, loop)
+            process_audio(state, mic, args.audio_input_block_size, loop, save_wake_audio_dir)
             _LOGGER.info("Restarting audio processing in 3s...")
             time.sleep(3)
 
