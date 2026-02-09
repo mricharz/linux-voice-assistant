@@ -12,7 +12,6 @@ from queue import Queue, Full, Empty
 from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
-import soundcard as sc
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
@@ -462,6 +461,27 @@ async def main() -> None:
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    _LOGGER.debug(args)
+
+    # Import soundcard with retry - PulseAudio may not be ready yet after boot
+    sc = None
+    for attempt in range(30):
+        try:
+            import soundcard as sc
+            break
+        except (AssertionError, Exception) as err:
+            if attempt < 29:
+                _LOGGER.warning(
+                    "PulseAudio not ready (attempt %d/30): %s. Retrying in 2s...",
+                    attempt + 1,
+                    err,
+                )
+                await asyncio.sleep(2)
+            else:
+                _LOGGER.error("PulseAudio not available after 30 attempts, giving up")
+                raise
+
     if args.list_input_devices:
         print("Input devices")
         print("=" * 13)
@@ -477,9 +497,6 @@ async def main() -> None:
         for speaker in player.audio_device_list:  # type: ignore
             print(speaker["name"] + ":", speaker["description"])
         return
-
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-    _LOGGER.debug(args)
 
     if (not args.name) and (not args.list_input_devices) and (not args.list_output_devices):
         parser.error("the following arguments are required: --name")
