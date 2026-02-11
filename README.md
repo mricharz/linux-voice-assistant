@@ -98,9 +98,9 @@ Once connected, the device exposes several entities in Home Assistant:
 - **ha** (default): Uses Home Assistant's pipeline for voice activity detection
 - **local**: Uses local WebRTC VAD for faster speech end detection (reduces latency)
    
-## UX Feedback: Sounds and Command Hooks
+## UX Feedback: Sounds and Event Sockets
 
-Linux Voice Assistant can play short local sounds and run commands at important pipeline transitions.
+Linux Voice Assistant can play short local sounds and send events to sockets at important pipeline transitions.
 This is useful for LED rings, beeps, or external scripts.
 
 ### Sounds
