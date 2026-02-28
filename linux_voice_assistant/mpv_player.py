@@ -100,6 +100,9 @@ class MpvMediaPlayer:
     ) -> None:
         """Start playing a PCM stream (16kHz, 16-bit, mono) via python_stream."""
         if stop_first:
+            # Clear existing callbacks before stopping to prevent them firing
+            with self._done_callback_lock:
+                self._done_callback = None
             self.stop()
 
         # Drain any leftover data from a previous stream
