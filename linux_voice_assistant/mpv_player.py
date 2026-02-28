@@ -20,6 +20,8 @@ class MpvMediaPlayer:
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
+            log_handler=self._mpv_log,
+            loglevel="debug",
         )
 
         self._set_option_if_supported("audio-device-keep-open", "yes")
@@ -131,6 +133,10 @@ class MpvMediaPlayer:
             _LOGGER.warning("Sound file not found during preload: %s", resolved)
         except Exception:
             _LOGGER.exception("Failed to preload sound: %s", resolved)
+
+    @staticmethod
+    def _mpv_log(loglevel: str, component: str, message: str) -> None:
+        _LOGGER.debug("[mpv/%s] %s", component, message.strip())
 
     def _set_option_if_supported(self, option: str, value: str) -> None:
         """Best-effort helper to apply mpv options only if supported by the runtime."""
