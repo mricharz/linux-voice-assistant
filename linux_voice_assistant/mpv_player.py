@@ -13,6 +13,48 @@ from mpv import MPV
 _LOGGER = logging.getLogger(__name__)
 
 
+class _PcmStreamFrontend:
+    """Non-seekable stream frontend for PCM TTS audio.
+
+    Intentionally omits a ``seek`` method so that mpv treats the stream as
+    non-seekable.  python-mpv's built-in ``GeneratorStream`` always exposes
+    ``seek``, which causes mpv to seek repeatedly during format probing —
+    each seek restarts the generator and corrupts the queue-based pipeline.
+    """
+
+    def __init__(
+        self,
+        pcm_queue: "queue.Queue[Optional[bytes]]",
+        wav_header: bytes,
+        on_started: Callable[[], None],
+    ) -> None:
+        self._queue = pcm_queue
+        self._buffer = wav_header
+        self._eof = False
+        self._on_started = on_started
+
+    def read(self, size: int) -> bytes:
+        if self._on_started:
+            self._on_started()
+            self._on_started = None  # type: ignore[assignment]
+        if not self._buffer:
+            if self._eof:
+                return b""
+            chunk = self._queue.get()
+            if chunk is None:
+                self._eof = True
+                return b""
+            self._buffer = chunk
+        rv, self._buffer = self._buffer[:size], self._buffer[size:]
+        return rv
+
+    def close(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        self._eof = True
+
+
 class MpvMediaPlayer:
     def __init__(self, device: Optional[str] = None) -> None:
         self.player = MPV(
@@ -48,21 +90,14 @@ class MpvMediaPlayer:
         self._pcm_done_callback: Optional[Callable[[], None]] = None
         self._pcm_generator_started = False
 
-        @self.player.python_stream("tts_pcm")
-        def _tts_pcm_stream():
-            self._pcm_generator_started = True
-            _LOGGER.debug("PCM stream generator started")
-            try:
-                # Emit a WAV header so mpv auto-detects the format
-                yield _wav_header_16khz_s16le()
-                while True:
-                    chunk = self._pcm_queue.get()
-                    if chunk is None:
-                        _LOGGER.debug("PCM stream generator: got sentinel, ending")
-                        return
-                    yield chunk
-            except Exception:
-                _LOGGER.exception("PCM stream generator error")
+        @self.player.register_stream_protocol("ttspcm")
+        def _open_pcm_stream(uri: str) -> _PcmStreamFrontend:
+            _LOGGER.debug("Opening PCM stream: %s", uri)
+            return _PcmStreamFrontend(
+                self._pcm_queue,
+                _wav_header_16khz_s16le(),
+                self._mark_generator_started,
+            )
 
         self.player.event_callback("end-file")(self._on_end_file)
 
@@ -108,7 +143,7 @@ class MpvMediaPlayer:
         done_callback: Optional[Callable[[], None]] = None,
         stop_first: bool = True,
     ) -> None:
-        """Start playing a PCM stream (16kHz, 16-bit, mono) via python_stream."""
+        """Start playing a PCM stream (16kHz, 16-bit, mono) via non-seekable stream."""
         # Clear ALL callbacks before stopping to prevent end-file race condition
         with self._done_callback_lock:
             self._done_callback = None
@@ -134,7 +169,7 @@ class MpvMediaPlayer:
         self.player.pause = False
 
         _LOGGER.debug("Starting PCM stream playback")
-        self.player.play("python://tts_pcm")
+        self.player.play("ttspcm://stream")
 
         # Set callback AFTER loadfile to avoid race with end-file from stop()
         with self._done_callback_lock:
@@ -216,6 +251,10 @@ class MpvMediaPlayer:
             _LOGGER.warning("Sound file not found during preload: %s", resolved)
         except Exception:
             _LOGGER.exception("Failed to preload sound: %s", resolved)
+
+    def _mark_generator_started(self) -> None:
+        self._pcm_generator_started = True
+        _LOGGER.debug("PCM stream reader started")
 
     @staticmethod
     def _mpv_log(loglevel: str, component: str, message: str) -> None:
