@@ -374,8 +374,6 @@ class VoiceSatelliteProtocol(APIServer):
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
             if data.get("tts_start_streaming") == "1":
-                if url := data.get("url"):
-                    self._tts_url = url
                 self.play_tts()
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
