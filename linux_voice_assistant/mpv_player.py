@@ -48,11 +48,16 @@ class MpvMediaPlayer:
 
         @self.player.python_stream("tts_pcm")
         def _tts_pcm_stream():
-            while True:
-                chunk = self._pcm_queue.get()
-                if chunk is None:
-                    return
-                yield chunk
+            _LOGGER.debug("PCM stream generator started")
+            try:
+                while True:
+                    chunk = self._pcm_queue.get()
+                    if chunk is None:
+                        _LOGGER.debug("PCM stream generator: got sentinel, ending")
+                        return
+                    yield chunk
+            except Exception:
+                _LOGGER.exception("PCM stream generator error")
 
         self.player.event_callback("end-file")(self._on_end_file)
 
@@ -99,11 +104,16 @@ class MpvMediaPlayer:
         stop_first: bool = True,
     ) -> None:
         """Start playing a PCM stream (16kHz, 16-bit, mono) via python_stream."""
+        # Clear ALL callbacks before stopping to prevent end-file race condition
+        with self._done_callback_lock:
+            self._done_callback = None
+            self._pcm_done_callback = None
+
         if stop_first:
-            # Clear existing callbacks before stopping to prevent them firing
-            with self._done_callback_lock:
-                self._done_callback = None
-            self.stop()
+            if self._pcm_streaming:
+                self.stop_pcm_stream()
+            self.player.stop()
+            self._playlist.clear()
 
         # Drain any leftover data from a previous stream
         while not self._pcm_queue.empty():
@@ -113,7 +123,6 @@ class MpvMediaPlayer:
                 break
 
         self._pcm_streaming = True
-        self._pcm_done_callback = done_callback
         self.is_playing = True
         self.is_paused = False
         self.player.pause = False
@@ -128,6 +137,10 @@ class MpvMediaPlayer:
             "demuxer-rawaudio-channels=1,"
             "demuxer-rawaudio-format=s16le",
         )
+
+        # Set callback AFTER loadfile to avoid race with end-file from stop()
+        with self._done_callback_lock:
+            self._pcm_done_callback = done_callback
 
     def write_pcm_chunk(self, data: bytes) -> None:
         """Write a chunk of PCM data to the stream."""
@@ -239,6 +252,15 @@ class MpvMediaPlayer:
             _LOGGER.debug("Error terminating mpv player", exc_info=True)
 
     def _on_end_file(self, event) -> None:
+        reason = getattr(event, "reason", None) if event else None
+        _LOGGER.debug(
+            "end-file: reason=%s, pcm_streaming=%s, has_done_cb=%s, has_pcm_cb=%s",
+            reason,
+            self._pcm_streaming,
+            self._done_callback is not None,
+            self._pcm_done_callback is not None,
+        )
+
         if self._playlist:
             self.player.play(self._playlist.pop(0))
             return

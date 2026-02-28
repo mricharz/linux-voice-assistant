@@ -46,6 +46,9 @@ class APIServer(asyncio.Protocol):
             _LOGGER.warning("Unknown message type: %d (len=%d)", msg_type, len(packet_data))
             return
         msg_class = MESSAGE_TYPE_TO_PROTO[msg_type]
+        # Log non-trivial message types (skip ping/pong)
+        if msg_type not in (7, 8):  # PingRequest=7, PingResponse=8
+            _LOGGER.debug("Received msg_type=%d (%s) len=%d", msg_type, msg_class.__name__, len(packet_data))
         msg_inst = msg_class.FromString(packet_data)
 
         if isinstance(msg_inst, HelloRequest):
