@@ -45,9 +45,11 @@ class MpvMediaPlayer:
         self._pcm_queue: queue.Queue[Optional[bytes]] = queue.Queue()
         self._pcm_streaming = False
         self._pcm_done_callback: Optional[Callable[[], None]] = None
+        self._pcm_generator_started = False
 
         @self.player.python_stream("tts_pcm")
         def _tts_pcm_stream():
+            self._pcm_generator_started = True
             _LOGGER.debug("PCM stream generator started")
             try:
                 while True:
@@ -123,6 +125,7 @@ class MpvMediaPlayer:
                 break
 
         self._pcm_streaming = True
+        self._pcm_generator_started = False
         self.is_playing = True
         self.is_paused = False
         self.player.pause = False
@@ -274,7 +277,7 @@ class MpvMediaPlayer:
             if self._done_callback:
                 todo_callback = self._done_callback
                 self._done_callback = None
-            elif self._pcm_done_callback:
+            elif self._pcm_done_callback and self._pcm_generator_started:
                 todo_callback = self._pcm_done_callback
                 self._pcm_done_callback = None
 
