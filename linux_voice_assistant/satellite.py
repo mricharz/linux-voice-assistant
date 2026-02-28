@@ -397,16 +397,20 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
 
         elif event_type.value == 98:  # TTS_STREAM_START
-            # Don't start PCM stream here — wait for actual VoiceAssistantAudio
-            # data. HA sends this event even when tts.async_get_stream() returns
-            # None (TTS engine doesn't support streaming), so starting here
-            # would block the URL fallback in play_tts().
-            _LOGGER.debug("TTS_STREAM_START received, waiting for audio data")
+            # Block URL fallback — PCM audio is expected.  If no audio
+            # arrives, TTS_STREAM_END will fall back to URL playback.
+            self._tts_played = True
+            _LOGGER.debug("TTS_STREAM_START received, blocking URL fallback")
 
         elif event_type.value == 99:  # TTS_STREAM_END
             if self._tts_streaming:
                 self._tts_streaming = False
                 self.state.tts_player.end_pcm_stream()
+            else:
+                # No PCM audio arrived (TTS engine doesn't support streaming).
+                # _tts_played was reset at RUN_END, so play_tts() can proceed.
+                _LOGGER.debug("TTS_STREAM_END without audio, falling back to URL")
+                self.play_tts()
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
             code = data.get("code", "") or ""
