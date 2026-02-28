@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from threading import Lock
@@ -52,6 +53,8 @@ class MpvMediaPlayer:
             self._pcm_generator_started = True
             _LOGGER.debug("PCM stream generator started")
             try:
+                # Emit a WAV header so mpv auto-detects the format
+                yield _wav_header_16khz_s16le()
                 while True:
                     chunk = self._pcm_queue.get()
                     if chunk is None:
@@ -131,15 +134,7 @@ class MpvMediaPlayer:
         self.player.pause = False
 
         _LOGGER.debug("Starting PCM stream playback")
-        self.player.command(
-            "loadfile",
-            "python://tts_pcm",
-            "replace",
-            "demuxer=rawaudio,"
-            "demuxer-rawaudio-rate=16000,"
-            "demuxer-rawaudio-channels=1,"
-            "demuxer-rawaudio-format=s16le",
-        )
+        self.player.play("python://tts_pcm")
 
         # Set callback AFTER loadfile to avoid race with end-file from stop()
         with self._done_callback_lock:
@@ -286,3 +281,29 @@ class MpvMediaPlayer:
                 todo_callback()
             except Exception:
                 _LOGGER.exception("Unexpected error running done callback")
+
+
+def _wav_header_16khz_s16le() -> bytes:
+    """Return a 44-byte WAV header for 16kHz 16-bit mono with unknown length."""
+    sample_rate = 16000
+    channels = 1
+    bits = 16
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    data_size = 0x7FFFFFFF
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        data_size + 36,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits,
+        b"data",
+        data_size,
+    )
