@@ -112,6 +112,17 @@ def measure_once(
         audio_samplerate=SAMPLE_RATE,
     )
     player = MPV(**mpv_kwargs)
+    # Match the HTTP stream optimizations from mpv_player.py
+    for opt, val in [
+        ("demuxer-lavf-probesize", "32768"),
+        ("demuxer-lavf-analyzeduration", "0.1"),
+        ("demuxer", "lavf"),
+        ("ytdl", "no"),
+    ]:
+        try:
+            player[opt] = val
+        except Exception:
+            pass
     if audio_device:
         player["audio-device"] = audio_device
 

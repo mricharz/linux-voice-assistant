@@ -31,6 +31,12 @@ class MpvMediaPlayer:
         self._set_option_if_supported("audio-device-keep-open", "yes")
         self._set_option_if_supported("audio-stream-silence", "yes")
 
+        # HTTP stream latency optimizations
+        self._set_option_if_supported("demuxer-lavf-probesize", "32768")
+        self._set_option_if_supported("demuxer-lavf-analyzeduration", "0.1")
+        self._set_option_if_supported("demuxer", "lavf")
+        self._set_option_if_supported("ytdl", "no")
+
         if device:
             self.player["audio-device"] = device
 
