@@ -302,6 +302,13 @@ class MpvMediaPlayer:
             self.player.play(self._playlist.pop(0))
             return
 
+        # Guard: if a PCM stream is being set up but hasn't started yet,
+        # this end-file is from a *previous* file (e.g. thinking sound
+        # stopped by start_pcm_stream).  Don't touch PCM state.
+        if self._pcm_streaming and not self._pcm_generator_started:
+            _LOGGER.debug("end-file: ignoring stale event (PCM stream pending)")
+            return
+
         self.is_playing = False
         self.is_paused = False
         self._pcm_streaming = False
