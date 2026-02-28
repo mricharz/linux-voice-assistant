@@ -1,11 +1,11 @@
 """Media player using mpv in a subprocess."""
 
 import logging
+import queue
 from collections.abc import Callable
+from pathlib import Path
 from threading import Lock
 from typing import List, Optional, Set, Union
-
-from pathlib import Path
 
 from mpv import MPV
 
@@ -40,6 +40,19 @@ class MpvMediaPlayer:
         self._duck_volume: int = 50
         self._unduck_volume: int = 100
         self._preloaded_files: Set[str] = set()
+
+        # PCM streaming state
+        self._pcm_queue: queue.Queue[Optional[bytes]] = queue.Queue()
+        self._pcm_streaming = False
+        self._pcm_done_callback: Optional[Callable[[], None]] = None
+
+        @self.player.python_stream("tts_pcm")
+        def _tts_pcm_stream():
+            while True:
+                chunk = self._pcm_queue.get()
+                if chunk is None:
+                    return
+                yield chunk
 
         self.player.event_callback("end-file")(self._on_end_file)
 
@@ -80,6 +93,60 @@ class MpvMediaPlayer:
         self.player.pause = False
         self.player.play(next_url)
 
+    def start_pcm_stream(
+        self,
+        done_callback: Optional[Callable[[], None]] = None,
+        stop_first: bool = True,
+    ) -> None:
+        """Start playing a PCM stream (16kHz, 16-bit, mono) via python_stream."""
+        if stop_first:
+            self.stop()
+
+        # Drain any leftover data from a previous stream
+        while not self._pcm_queue.empty():
+            try:
+                self._pcm_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self._pcm_streaming = True
+        self._pcm_done_callback = done_callback
+        self.is_playing = True
+        self.is_paused = False
+        self.player.pause = False
+
+        _LOGGER.debug("Starting PCM stream playback")
+        self.player.command(
+            "loadfile",
+            "python://tts_pcm",
+            "replace",
+            "demuxer=rawaudio,"
+            "demuxer-rawaudio-rate=16000,"
+            "demuxer-rawaudio-channels=1,"
+            "demuxer-rawaudio-format=s16le",
+        )
+
+    def write_pcm_chunk(self, data: bytes) -> None:
+        """Write a chunk of PCM data to the stream."""
+        if self._pcm_streaming:
+            self._pcm_queue.put(data)
+
+    def end_pcm_stream(self) -> None:
+        """Signal end of PCM stream (normal completion)."""
+        if self._pcm_streaming:
+            self._pcm_streaming = False
+            self._pcm_queue.put(None)
+
+    def stop_pcm_stream(self) -> None:
+        """Abort PCM stream immediately (e.g. stop word interrupt)."""
+        self._pcm_streaming = False
+        while not self._pcm_queue.empty():
+            try:
+                self._pcm_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._pcm_queue.put(None)
+
     def pause(self) -> None:
         was_active = self.is_playing or self.is_paused
         self.player.pause = True
@@ -96,6 +163,8 @@ class MpvMediaPlayer:
             self.is_playing = False
 
     def stop(self) -> None:
+        if self._pcm_streaming:
+            self.stop_pcm_stream()
         self.player.stop()
         self._playlist.clear()
         self.is_playing = False
@@ -173,12 +242,16 @@ class MpvMediaPlayer:
 
         self.is_playing = False
         self.is_paused = False
+        self._pcm_streaming = False
 
         todo_callback: Optional[Callable[[], None]] = None
         with self._done_callback_lock:
             if self._done_callback:
                 todo_callback = self._done_callback
                 self._done_callback = None
+            elif self._pcm_done_callback:
+                todo_callback = self._pcm_done_callback
+                self._pcm_done_callback = None
 
         if todo_callback:
             try:

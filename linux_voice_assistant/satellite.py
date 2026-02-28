@@ -24,21 +24,22 @@ import asyncio
 import logging
 import re
 import time
-from pathlib import Path
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Dict, Optional, Set, Union
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
+    ConnectRequest,
     DeviceInfoRequest,
     DeviceInfoResponse,
     ListEntitiesDoneResponse,
     ListEntitiesRequest,
     MediaPlayerCommandRequest,
-    SubscribeHomeAssistantStatesRequest,
-    SwitchCommandRequest,
     NumberCommandRequest,
     SelectCommandRequest,
+    SubscribeHomeAssistantStatesRequest,
+    SwitchCommandRequest,
     VoiceAssistantAnnounceFinished,
     VoiceAssistantAnnounceRequest,
     VoiceAssistantAudio,
@@ -49,10 +50,8 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     VoiceAssistantSetConfiguration,
     VoiceAssistantTimerEventResponse,
     VoiceAssistantWakeWord,
-    ConnectRequest,
 )
 from aioesphomeapi.core import MESSAGE_TYPE_TO_PROTO
-
 from aioesphomeapi.model import (
     VoiceAssistantEventType,
     VoiceAssistantFeature,
@@ -89,6 +88,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         self._tts_url: Optional[str] = None
         self._tts_played = False
+        self._tts_streaming = False
         self._continue_conversation = False
         self._timer_finished = False
         self._thinking_played = False
@@ -331,7 +331,9 @@ class VoiceSatelliteProtocol(APIServer):
 
     # -------------------------------------------------------------------------
 
-    def handle_voice_event(self, event_type: VoiceAssistantEventType, data: Dict[str, str]) -> None:
+    def handle_voice_event(
+        self, event_type: VoiceAssistantEventType, data: Dict[str, str]
+    ) -> None:
         _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
 
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
@@ -355,8 +357,8 @@ class VoiceSatelliteProtocol(APIServer):
             pass
 
         elif event_type in (
-                VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
-                VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
+            VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
+            VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
             # Prevent double-handling (local VAD + HA VAD)
             if self._speech_end_handled:
@@ -394,6 +396,14 @@ class VoiceSatelliteProtocol(APIServer):
                 self._tts_finished()
             self._tts_played = False
 
+        elif event_type.value == 98:  # TTS_STREAM_START
+            self._start_tts_pcm_stream()
+
+        elif event_type.value == 99:  # TTS_STREAM_END
+            if self._tts_streaming:
+                self._tts_streaming = False
+                self.state.tts_player.end_pcm_stream()
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
             code = data.get("code", "") or ""
             msg = data.get("message", "") or ""
@@ -402,6 +412,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._block_wake_words = False
             self._run_started_at = None
             self._speech_end_handled = False
+            self._tts_streaming = False
             self._handle_pipeline_error(code, msg)
 
         # else: ignore unhandled events (keep DEBUG logs)
@@ -412,7 +423,7 @@ class VoiceSatelliteProtocol(APIServer):
         try:
             msg = VoiceAssistantAudio()
             # depending on proto version:
-            if hasattr(msg, "end") :
+            if hasattr(msg, "end"):
                 msg.end = True
             elif hasattr(msg, "end_of_stream"):
                 msg.end_of_stream = True
@@ -451,9 +462,9 @@ class VoiceSatelliteProtocol(APIServer):
     # -------------------------------------------------------------------------
 
     def handle_timer_event(
-            self,
-            event_type: VoiceAssistantTimerEventType,
-            msg: VoiceAssistantTimerEventResponse,
+        self,
+        event_type: VoiceAssistantTimerEventType,
+        msg: VoiceAssistantTimerEventResponse,
     ) -> None:
         _LOGGER.debug("Timer event: type=%s", event_type.name)
         if event_type == VoiceAssistantTimerEventType.VOICE_ASSISTANT_TIMER_STARTED:
@@ -495,6 +506,16 @@ class VoiceSatelliteProtocol(APIServer):
         elif isinstance(msg, VoiceAssistantTimerEventResponse):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
 
+        elif isinstance(msg, VoiceAssistantAudio):
+            if msg.data and not getattr(msg, "end", False):
+                if not self._tts_streaming:
+                    self._start_tts_pcm_stream()
+                self.state.tts_player.write_pcm_chunk(msg.data)
+            if getattr(msg, "end", False):
+                if self._tts_streaming:
+                    self._tts_streaming = False
+                    self.state.tts_player.end_pcm_stream()
+
         elif isinstance(msg, DeviceInfoRequest):
             base_name = re.sub(r"[\s-]+", "-", self.state.name.lower()).strip("-")
             mac_no_colon = self.state.mac_address.replace(":", "").lower()
@@ -508,24 +529,25 @@ class VoiceSatelliteProtocol(APIServer):
                 manufacturer="Open Home Foundation",
                 model="Linux Voice Assistant",
                 voice_assistant_feature_flags=(
-                        VoiceAssistantFeature.VOICE_ASSISTANT
-                        | VoiceAssistantFeature.API_AUDIO
-                        | VoiceAssistantFeature.ANNOUNCE
-                        | VoiceAssistantFeature.START_CONVERSATION
-                        | VoiceAssistantFeature.TIMERS
+                    VoiceAssistantFeature.VOICE_ASSISTANT
+                    | VoiceAssistantFeature.SPEAKER
+                    | VoiceAssistantFeature.API_AUDIO
+                    | VoiceAssistantFeature.ANNOUNCE
+                    | VoiceAssistantFeature.START_CONVERSATION
+                    | VoiceAssistantFeature.TIMERS
                 ),
             )
 
         elif isinstance(
-                msg,
-                (
-                        ListEntitiesRequest,
-                        SubscribeHomeAssistantStatesRequest,
-                        MediaPlayerCommandRequest,
-                        SwitchCommandRequest,
-                        NumberCommandRequest,
-                        SelectCommandRequest,
-                ),
+            msg,
+            (
+                ListEntitiesRequest,
+                SubscribeHomeAssistantStatesRequest,
+                MediaPlayerCommandRequest,
+                SwitchCommandRequest,
+                NumberCommandRequest,
+                SelectCommandRequest,
+            ),
         ):
             for entity in self.state.entities:
                 yield from entity.handle_message(msg)
@@ -620,11 +642,14 @@ class VoiceSatelliteProtocol(APIServer):
 
         wakeup_sound = getattr(self.state, "wakeup_sound", "") or ""
         if wakeup_sound:
+
             def _finished_playing() -> None:
                 loop = self._loop
                 if loop is not None:
                     loop.call_soon_threadsafe(
-                        lambda: self._start_pipeline_run(wake_word_phrase=wake_word_phrase)
+                        lambda: self._start_pipeline_run(
+                            wake_word_phrase=wake_word_phrase
+                        )
                     )
                 else:
                     self._start_pipeline_run(wake_word_phrase=wake_word_phrase)
@@ -636,7 +661,9 @@ class VoiceSatelliteProtocol(APIServer):
                     stop_first=True,
                     volume_offset=-5,
                 )
-                _LOGGER.debug("Waiting for wakeup sound to finish before streaming audio")
+                _LOGGER.debug(
+                    "Waiting for wakeup sound to finish before streaming audio"
+                )
                 return
             except Exception:
                 _LOGGER.exception("Failed to play wakeup sound")
@@ -660,6 +687,9 @@ class VoiceSatelliteProtocol(APIServer):
 
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
+        if self._tts_streaming:
+            self._tts_streaming = False
+            self.state.tts_player.stop_pcm_stream()
         self.state.tts_player.stop()
         emit_event(self.state, "stop")
 
@@ -679,6 +709,16 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.state.active_wake_words.add(self.state.stop_word.id)
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
+
+    def _start_tts_pcm_stream(self) -> None:
+        """Begin PCM streaming playback from HA."""
+        if self._tts_streaming:
+            return
+        self._tts_streaming = True
+        self._tts_played = True  # Prevent URL-based play_tts() fallback
+        self.state.active_wake_words.add(self.state.stop_word.id)
+        emit_event(self.state, "speak")
+        self.state.tts_player.start_pcm_stream(done_callback=self._tts_finished)
 
     def duck(self) -> None:
         if self.state.music_player is self.state.tts_player:
@@ -769,6 +809,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         self._tts_url = None
         self._tts_played = False
+        self._tts_streaming = False
         self._continue_conversation = False
         self._timer_finished = False
         self._thinking_played = False
@@ -801,6 +842,8 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.connected = True
             states = []
             for entity in self.state.entities:
-                states.extend(entity.handle_message(SubscribeHomeAssistantStatesRequest()))
+                states.extend(
+                    entity.handle_message(SubscribeHomeAssistantStatesRequest())
+                )
             self.send_messages(states)
             _LOGGER.debug("Sent entity states after connect")
