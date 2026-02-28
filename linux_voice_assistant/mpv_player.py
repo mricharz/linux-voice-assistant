@@ -1,6 +1,7 @@
 """Media player using mpv in a subprocess."""
 
 import logging
+import time
 from collections.abc import Callable
 from threading import Lock
 from typing import List, Optional, Set, Union
@@ -14,15 +15,18 @@ _LOGGER = logging.getLogger(__name__)
 
 class MpvMediaPlayer:
     def __init__(self, device: Optional[str] = None) -> None:
-        self.player = MPV(
+        mpv_kwargs = dict(
             # Low-latency audio settings
             audio_buffer=0.05,  # 50ms buffer for lower latency
             cache="no",  # Disable cache for faster start
             demuxer_readahead_secs=0,  # No read-ahead buffering
             audio_samplerate=48000,  # Match PulseAudio rate to avoid resampling
-            # log_handler=self._mpv_log,
-            # loglevel="debug",
         )
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            mpv_kwargs["log_handler"] = self._mpv_log
+            mpv_kwargs["loglevel"] = "debug"
+
+        self.player = MPV(**mpv_kwargs)
 
         self._set_option_if_supported("audio-device-keep-open", "yes")
         self._set_option_if_supported("audio-stream-silence", "yes")
@@ -40,8 +44,19 @@ class MpvMediaPlayer:
         self._duck_volume: int = 50
         self._unduck_volume: int = 100
         self._preloaded_files: Set[str] = set()
+        self._play_start_time: Optional[float] = None
 
         self.player.event_callback("end-file")(self._on_end_file)
+
+        @self.player.property_observer("time-pos")
+        def _on_time_pos(_name: str, value: Optional[float]) -> None:
+            if value is not None and value > 0 and self._play_start_time is not None:
+                delta = time.monotonic() - self._play_start_time
+                _LOGGER.info(
+                    "Playback audio started after %.3fs (time-pos=%.3f)",
+                    delta, value,
+                )
+                self._play_start_time = None
 
     def play(
         self,
@@ -76,6 +91,7 @@ class MpvMediaPlayer:
 
         self.is_playing = True
         self.is_paused = False
+        self._play_start_time = time.monotonic()
         # Ensure playback starts even if the player was previously paused.
         self.player.pause = False
         self.player.play(next_url)
@@ -134,9 +150,12 @@ class MpvMediaPlayer:
         except Exception:
             _LOGGER.exception("Failed to preload sound: %s", resolved)
 
-    @staticmethod
-    def _mpv_log(loglevel: str, component: str, message: str) -> None:
-        _LOGGER.debug("[mpv/%s] %s", component, message.strip())
+    def _mpv_log(self, loglevel: str, component: str, message: str) -> None:
+        if self._play_start_time is not None:
+            delta = time.monotonic() - self._play_start_time
+            _LOGGER.debug("[mpv/%s +%.3fs] %s", component, delta, message.strip())
+        else:
+            _LOGGER.debug("[mpv/%s] %s", component, message.strip())
 
     def _set_option_if_supported(self, option: str, value: str) -> None:
         """Best-effort helper to apply mpv options only if supported by the runtime."""
