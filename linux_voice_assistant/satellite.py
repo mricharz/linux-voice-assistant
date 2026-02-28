@@ -675,13 +675,7 @@ class VoiceSatelliteProtocol(APIServer):
             return
 
         self._tts_played = True
-        if self._run_started_at is not None:
-            _LOGGER.info(
-                "Playing TTS (%.3fs after wake): %s",
-                time.monotonic() - self._run_started_at, self._tts_url,
-            )
-        else:
-            _LOGGER.debug("Playing TTS response: %s", self._tts_url)
+        _LOGGER.debug("Playing TTS response: %s", self._tts_url)
 
         self.state.active_wake_words.add(self.state.stop_word.id)
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
