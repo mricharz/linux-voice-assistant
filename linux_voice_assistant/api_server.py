@@ -42,6 +42,9 @@ class APIServer(asyncio.Protocol):
         pass
 
     def process_packet(self, msg_type: int, packet_data: bytes) -> None:
+        if msg_type not in MESSAGE_TYPE_TO_PROTO:
+            _LOGGER.warning("Unknown message type: %d (len=%d)", msg_type, len(packet_data))
+            return
         msg_class = MESSAGE_TYPE_TO_PROTO[msg_type]
         msg_inst = msg_class.FromString(packet_data)
 

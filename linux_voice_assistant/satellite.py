@@ -507,6 +507,11 @@ class VoiceSatelliteProtocol(APIServer):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
 
         elif isinstance(msg, VoiceAssistantAudio):
+            _LOGGER.debug(
+                "VoiceAssistantAudio: data_len=%d, end=%s",
+                len(msg.data) if msg.data else 0,
+                getattr(msg, "end", False),
+            )
             if msg.data and not getattr(msg, "end", False):
                 if not self._tts_streaming:
                     self._start_tts_pcm_stream()
