@@ -375,8 +375,7 @@ class VoiceSatelliteProtocol(APIServer):
             emit_event(self.state, "intent_start")
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
-            if data.get("tts_start_streaming") == "1":
-                self.play_tts()
+            pass
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
             if data.get("continue_conversation") == "1":
