@@ -19,6 +19,7 @@ import json
 import shutil
 import threading
 import urllib.parse
+import wave
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ class FileManager:
             )
             dest = dest_dir / filename
             if src.is_file():
+                self._write_json(src, dest_dir, classification)
                 shutil.move(str(src), str(dest))
                 self._history.append((filename, classification, dest))
                 if classification == "positive":
@@ -74,6 +76,9 @@ class FileManager:
             src = self.input_dir / filename
             if dest.is_file():
                 shutil.move(str(dest), str(src))
+                json_path = dest.with_suffix(".json")
+                if json_path.is_file():
+                    json_path.unlink()
                 if classification == "positive":
                     self._positive -= 1
                 else:
@@ -83,6 +88,20 @@ class FileManager:
             return self._status_unlocked()
 
     # -- internal ----------------------------------------------------------
+
+    @staticmethod
+    def _write_json(wav_src: Path, dest_dir: Path, classification: str) -> None:
+        """Write a metadata JSON alongside the classified WAV."""
+        kind = "person" if classification == "positive" else "conversation"
+        meta: dict = {"kind": kind}
+        try:
+            with wave.open(str(wav_src), "rb") as wf:
+                meta["sample_rate"] = wf.getframerate()
+                meta["channels"] = wf.getnchannels()
+        except Exception:
+            pass
+        json_path = dest_dir / wav_src.with_suffix(".json").name
+        json_path.write_text(json.dumps(meta, indent=2) + "\n")
 
     def _status_unlocked(self) -> dict:
         total = len(self._files) + self._positive + self._negative
