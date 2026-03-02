@@ -87,7 +87,49 @@ class FileManager:
                 self._files.sort()
             return self._status_unlocked()
 
+    def delete_current(self, filename: str) -> dict:
+        with self._lock:
+            path = self.input_dir / filename
+            if path.is_file():
+                path.unlink()
+                self._files = [f for f in self._files if f != filename]
+            return self._status_unlocked()
+
+    def history(self) -> dict:
+        with self._lock:
+            return self._history_unlocked()
+
+    def delete_classified(self, filename: str, classification: str) -> dict:
+        with self._lock:
+            target_dir = (
+                self.pos_dir if classification == "positive" else self.neg_dir
+            )
+            wav_path = target_dir / filename
+            json_path = wav_path.with_suffix(".json")
+            if wav_path.is_file():
+                wav_path.unlink()
+            if json_path.is_file():
+                json_path.unlink()
+            if classification == "positive":
+                self._positive = max(0, self._positive - 1)
+            else:
+                self._negative = max(0, self._negative - 1)
+            self._history = [
+                h for h in self._history
+                if not (h[0] == filename and h[1] == classification)
+            ]
+            return self._history_unlocked()
+
     # -- internal ----------------------------------------------------------
+
+    def _history_unlocked(self) -> dict:
+        pos = sorted(
+            f.name for f in self.pos_dir.iterdir() if f.suffix.lower() == ".wav"
+        )
+        neg = sorted(
+            f.name for f in self.neg_dir.iterdir() if f.suffix.lower() == ".wav"
+        )
+        return {"positive": pos, "negative": neg}
 
     @staticmethod
     def _write_json(wav_src: Path, dest_dir: Path, classification: str) -> None:
@@ -137,9 +179,17 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
             self._send_html()
         elif path == "/api/status":
             self._send_json(self.file_manager.status())
+        elif path == "/api/history":
+            self._send_json(self.file_manager.history())
+        elif path.startswith("/api/audio/positive/"):
+            name = urllib.parse.unquote(path[len("/api/audio/positive/") :])
+            self._send_audio(name, self.file_manager.pos_dir)
+        elif path.startswith("/api/audio/negative/"):
+            name = urllib.parse.unquote(path[len("/api/audio/negative/") :])
+            self._send_audio(name, self.file_manager.neg_dir)
         elif path.startswith("/api/audio/"):
             name = urllib.parse.unquote(path[len("/api/audio/") :])
-            self._send_audio(name)
+            self._send_audio(name, self.file_manager.input_dir)
         else:
             self.send_error(404)
 
@@ -158,6 +208,22 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(self.file_manager.classify(filename, classification))
         elif path == "/api/undo":
             self._send_json(self.file_manager.undo())
+        elif path == "/api/delete":
+            filename = body.get("filename", "")
+            if not self._safe_name(filename):
+                self._send_json({"error": "invalid filename"}, 400)
+                return
+            self._send_json(self.file_manager.delete_current(filename))
+        elif path == "/api/delete-classified":
+            filename = body.get("filename", "")
+            classification = body.get("classification", "")
+            if classification not in ("positive", "negative"):
+                self._send_json({"error": "invalid classification"}, 400)
+                return
+            if not self._safe_name(filename):
+                self._send_json({"error": "invalid filename"}, 400)
+                return
+            self._send_json(self.file_manager.delete_classified(filename, classification))
         else:
             self.send_error(404)
 
@@ -189,11 +255,13 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_audio(self, name: str):
+    def _send_audio(self, name: str, base_dir: Path = None):
         if not self._safe_name(name):
             self.send_error(403)
             return
-        filepath = self.file_manager.input_dir / name
+        if base_dir is None:
+            base_dir = self.file_manager.input_dir
+        filepath = base_dir / name
         if not filepath.is_file():
             self.send_error(404)
             return
@@ -269,6 +337,40 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 .btn-accept{background:#4ecca3;color:#fff}
 .btn-undo{background:transparent;color:#888;border:2px solid #444;
   width:40px;height:40px;font-size:16px}
+.btn-delete{background:#ff6b35;color:#fff;width:44px;height:44px;font-size:18px}
+.btn-history{background:transparent;color:#aaa;border:2px solid #555;
+  border-radius:8px;width:auto;height:32px;font-size:13px;padding:0 12px;
+  cursor:pointer;display:flex;align-items:center;gap:4px}
+.btn-history:hover{border-color:#888;color:#eee}
+
+/* history overlay */
+#history{display:none;position:fixed;inset:0;background:#1a1a2e;z-index:30;
+  flex-direction:column;overflow:hidden}
+#history.open{display:flex}
+#hist-header{display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-bottom:1px solid #333}
+#hist-header h2{font-size:18px;font-weight:600}
+#hist-close{background:none;border:none;color:#aaa;font-size:24px;
+  cursor:pointer;padding:4px 8px}
+#hist-close:hover{color:#fff}
+#hist-tabs{display:flex;gap:0;border-bottom:1px solid #333}
+.hist-tab{flex:1;padding:10px;text-align:center;cursor:pointer;
+  font-size:14px;font-weight:600;border-bottom:3px solid transparent;
+  transition:border-color .2s,color .2s;color:#888}
+.hist-tab.active{color:#eee}
+.hist-tab.pos.active{border-color:#4ecca3;color:#4ecca3}
+.hist-tab.neg.active{border-color:#e74c3c;color:#e74c3c}
+#hist-list{flex:1;overflow-y:auto;padding:8px 0}
+.hist-item{display:flex;align-items:center;padding:8px 16px;gap:10px;
+  border-bottom:1px solid #222}
+.hist-item .fname{flex:1;font-size:13px;font-family:monospace;color:#ccc;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-btn{background:none;border:1px solid #555;border-radius:6px;
+  color:#ccc;width:36px;height:36px;font-size:16px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center}
+.hist-btn:hover{border-color:#aaa;color:#fff}
+.hist-btn.del:hover{border-color:#e74c3c;color:#e74c3c}
+.hist-empty{text-align:center;color:#555;padding:40px;font-size:14px}
 
 /* done screen */
 #done{display:none;position:fixed;inset:0;background:#1a1a2e;
@@ -288,6 +390,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <div id="progress">
   <div id="progress-bar-outer"><div id="progress-bar-inner"></div></div>
   <div id="progress-text">-</div>
+  <button class="btn-history" id="btn-history" title="History">&#9776; History</button>
 </div>
 
 <div id="card-area">
@@ -302,6 +405,7 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
 <div id="controls">
   <button class="btn btn-reject" id="btn-reject" title="Reject (Arrow Left)">&#10007;</button>
   <button class="btn btn-undo" id="btn-undo" title="Undo (Ctrl+Z)">&#8630;</button>
+  <button class="btn btn-delete" id="btn-discard" title="Delete (D)">&#128465;</button>
   <button class="btn btn-replay" id="btn-replay" title="Replay (Space)">&#9654;</button>
   <button class="btn btn-accept" id="btn-accept" title="Accept (Arrow Right)">&#10003;</button>
 </div>
@@ -313,6 +417,18 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
   <div class="stat">Reviewed: <b id="done-total">0</b></div>
   <div class="stat" style="color:#4ecca3">Positive: <b id="done-pos">0</b></div>
   <div class="stat" style="color:#e74c3c">Negative: <b id="done-neg">0</b></div>
+</div>
+
+<div id="history">
+  <div id="hist-header">
+    <h2>History</h2>
+    <button id="hist-close">&times;</button>
+  </div>
+  <div id="hist-tabs">
+    <div class="hist-tab pos active" data-cls="positive">Positive (0)</div>
+    <div class="hist-tab neg" data-cls="negative">Negative (0)</div>
+  </div>
+  <div id="hist-list"></div>
 </div>
 
 <script>
@@ -432,6 +548,32 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
     busy = false;
   }
 
+  async function discard(){
+    if(busy || state.done || !state.filename) return;
+    busy = true;
+    audio.pause();
+    // animate down
+    card.style.transition = 'transform .35s ease, opacity .35s ease';
+    card.style.transform  = 'translateY(120%) scale(.8)';
+    card.style.opacity    = '0';
+    const d = await api('/api/delete',{filename:state.filename});
+    await new Promise(r=>setTimeout(r,300));
+    card.style.transition = 'none';
+    card.style.transform  = 'translateX(0) scale(.95)';
+    card.style.opacity    = '0';
+    indAccept.style.opacity = 0;
+    indReject.style.opacity = 0;
+    requestAnimationFrame(()=>{
+      requestAnimationFrame(()=>{
+        card.style.transition = 'transform .25s ease, opacity .25s ease';
+        card.style.transform  = '';
+        card.style.opacity    = '1';
+        loadCard(d);
+        busy = false;
+      });
+    });
+  }
+
   // ---- swipe gestures ----
   function onStart(x){
     if(busy || state.done) return;
@@ -477,18 +619,87 @@ html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFo
   document.addEventListener('mousemove', e=>{onMove(e.clientX);});
   document.addEventListener('mouseup', ()=>{onEnd();});
 
+  // ---- history dialog ----
+  const historyEl  = document.getElementById('history');
+  const histList   = document.getElementById('hist-list');
+  const histTabs   = document.querySelectorAll('.hist-tab');
+  let histAudio    = new Audio();
+  let histTab      = 'positive';
+  let histData     = {positive:[], negative:[]};
+
+  async function openHistory(){
+    audio.pause();
+    histData = await api('/api/history');
+    renderHistory();
+    historyEl.classList.add('open');
+  }
+  function closeHistory(){
+    histAudio.pause();
+    historyEl.classList.remove('open');
+    // refresh main status in case deletions happened
+    api('/api/status').then(d=>loadCard(d));
+  }
+  function renderHistory(){
+    histTabs.forEach(t=>{
+      const cls = t.dataset.cls;
+      t.classList.toggle('active', cls===histTab);
+      const n = histData[cls] ? histData[cls].length : 0;
+      t.textContent = (cls==='positive'?'Positive':'Negative')+' ('+n+')';
+    });
+    const files = histData[histTab] || [];
+    if(!files.length){
+      histList.innerHTML = '<div class="hist-empty">No files</div>';
+      return;
+    }
+    histList.innerHTML = files.map(f=>
+      '<div class="hist-item" data-name="'+f+'">'
+      +'<span class="fname">'+f+'</span>'
+      +'<button class="hist-btn play" title="Play">&#9654;</button>'
+      +'<button class="hist-btn del" title="Delete">&#128465;</button>'
+      +'</div>'
+    ).join('');
+  }
+  histList.addEventListener('click', async e=>{
+    const btn = e.target.closest('.hist-btn');
+    if(!btn) return;
+    const item = btn.closest('.hist-item');
+    const name = item.dataset.name;
+    if(btn.classList.contains('play')){
+      histAudio.pause();
+      histAudio.src = '/api/audio/'+histTab+'/'+encodeURIComponent(name);
+      histAudio.play().catch(()=>{});
+    } else if(btn.classList.contains('del')){
+      await api('/api/delete-classified',{filename:name, classification:histTab});
+      histData[histTab] = histData[histTab].filter(f=>f!==name);
+      renderHistory();
+    }
+  });
+  histTabs.forEach(t=>t.addEventListener('click',()=>{
+    histTab = t.dataset.cls;
+    histAudio.pause();
+    renderHistory();
+  }));
+  document.getElementById('hist-close').addEventListener('click', closeHistory);
+
   // buttons
   document.getElementById('btn-reject').addEventListener('click', ()=>classify('negative'));
   document.getElementById('btn-accept').addEventListener('click', ()=>classify('positive'));
   document.getElementById('btn-replay').addEventListener('click', ()=>replay());
   document.getElementById('btn-undo').addEventListener('click',   ()=>undo());
+  document.getElementById('btn-discard').addEventListener('click', ()=>discard());
+  document.getElementById('btn-history').addEventListener('click', ()=>openHistory());
 
   // keyboard
   document.addEventListener('keydown', e=>{
+    if(historyEl.classList.contains('open')){
+      if(e.key==='Escape') closeHistory();
+      return;
+    }
     if(e.key==='ArrowRight') classify('positive');
     else if(e.key==='ArrowLeft') classify('negative');
     else if(e.key===' '){e.preventDefault(); replay();}
     else if(e.key==='z' && (e.ctrlKey||e.metaKey)){e.preventDefault(); undo();}
+    else if(e.key==='d' || e.key==='Delete') discard();
   });
 
   // init
