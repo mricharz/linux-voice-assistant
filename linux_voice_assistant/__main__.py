@@ -10,14 +10,13 @@ import time
 import wave
 from collections import deque
 from pathlib import Path
-from queue import Queue, Full, Empty
+from queue import Empty, Full, Queue
 from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
+from aioesphomeapi.model import VoiceAssistantEventType
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
-
-from aioesphomeapi.model import VoiceAssistantEventType
 
 from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
@@ -60,13 +59,14 @@ def _send_audio_batch(state: ServerState, batch: List[bytes]) -> None:
         return
 
     from aioesphomeapi.api_pb2 import VoiceAssistantAudio  # local import
+
     sat.send_messages([VoiceAssistantAudio(data=b) for b in batch])
 
 
 def audio_sender_thread(
-        state: ServerState,
-        loop: asyncio.AbstractEventLoop,
-        batch_size: int = 4,
+    state: ServerState,
+    loop: asyncio.AbstractEventLoop,
+    batch_size: int = 4,
 ) -> None:
     """Blocking sender thread: batches audio and schedules 1 callback per batch."""
     while True:
@@ -89,10 +89,10 @@ def audio_sender_thread(
 
 
 def _schedule_sat_event(
-        loop: asyncio.AbstractEventLoop,
-        state: ServerState,
-        event_type: VoiceAssistantEventType,
-        data: Optional[Dict[str, str]] = None,
+    loop: asyncio.AbstractEventLoop,
+    state: ServerState,
+    event_type: VoiceAssistantEventType,
+    data: Optional[Dict[str, str]] = None,
 ) -> None:
     """Schedule a satellite event on the asyncio loop thread (thread-safe)."""
     sat = state.satellite
@@ -108,7 +108,9 @@ def _schedule_sat_stop(loop: asyncio.AbstractEventLoop, state: ServerState) -> N
     loop.call_soon_threadsafe(sat.stop)
 
 
-def _schedule_sat_wakeup(loop: asyncio.AbstractEventLoop, state: ServerState, wake_word) -> None:
+def _schedule_sat_wakeup(
+    loop: asyncio.AbstractEventLoop, state: ServerState, wake_word
+) -> None:
     sat = state.satellite
     if sat is None:
         return
@@ -116,11 +118,11 @@ def _schedule_sat_wakeup(loop: asyncio.AbstractEventLoop, state: ServerState, wa
 
 
 def process_audio(
-        state: ServerState,
-        mic,
-        block_size: int,
-        loop: asyncio.AbstractEventLoop,
-        save_wake_audio_dir: Optional[Path] = None,
+    state: ServerState,
+    mic,
+    block_size: int,
+    loop: asyncio.AbstractEventLoop,
+    save_wake_audio_dir: Optional[Path] = None,
 ) -> None:
     """Process audio chunks from the microphone.
 
@@ -163,7 +165,9 @@ def process_audio(
                 audio_chunk_array = mic_in.record(block_size).reshape(-1)
 
                 # In-place sanitize (cheaper than allocating new arrays)
-                np.nan_to_num(audio_chunk_array, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                np.nan_to_num(
+                    audio_chunk_array, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+                )
                 np.clip(audio_chunk_array, -1.0, 1.0, out=audio_chunk_array)
 
                 audio_chunk = (audio_chunk_array * 32767.0).astype("<i2").tobytes()
@@ -196,7 +200,7 @@ def process_audio(
                     ]
                     _LOGGER.debug(
                         "Active wake words: %s",
-                        [ww.id for ww in wake_words] if wake_words else "none"
+                        [ww.id for ww in wake_words] if wake_words else "none",
                     )
                     has_oww = any(isinstance(ww, OpenWakeWord) for ww in wake_words)
                     if micro_features is None:
@@ -218,7 +222,7 @@ def process_audio(
 
                 # -----------------------------------------------------------------
                 # Stop-word detection (only when enabled/active)
-                should_check_stop = (state.stop_word.id in state.active_wake_words)
+                should_check_stop = state.stop_word.id in state.active_wake_words
                 if should_check_stop:
                     if micro_features is None:
                         micro_features = MicroWakeWordFeatures()
@@ -249,7 +253,9 @@ def process_audio(
                     allow_vad = True
                     run_started_at = getattr(sat, "run_started_at", None)
                     if run_started_at is not None and local_vad.cfg.start_delay_ms > 0:
-                        allow_vad = (time.monotonic() - run_started_at) * 1000.0 >= local_vad.cfg.start_delay_ms
+                        allow_vad = (
+                            time.monotonic() - run_started_at
+                        ) * 1000.0 >= local_vad.cfg.start_delay_ms
 
                     for ev in local_vad.process(audio_chunk, allow_vad=allow_vad):
                         if ev == "vad_start":
@@ -297,8 +303,13 @@ def process_audio(
                             detected = wake_word.process_streaming(micro_input)
 
                             # Debug logging: show probability when above noise floor
-                            if hasattr(wake_word, "_probabilities") and wake_word._probabilities:
-                                prob_mean = sum(wake_word._probabilities) / len(wake_word._probabilities)
+                            if (
+                                hasattr(wake_word, "_probabilities")
+                                and wake_word._probabilities
+                            ):
+                                prob_mean = sum(wake_word._probabilities) / len(
+                                    wake_word._probabilities
+                                )
                                 if prob_mean > 0.1:  # Only log when above noise floor
                                     _LOGGER.debug(
                                         "MicroWakeWord '%s': prob=%.3f (cutoff=%.3f) [%s]",
@@ -323,14 +334,23 @@ def process_audio(
 
                     if activated:
                         now = time.monotonic()
-                        if (last_active is None) or ((now - last_active) > state.refractory_seconds):
+                        if (last_active is None) or (
+                            (now - last_active) > state.refractory_seconds
+                        ):
                             # Log activation with probability info
                             if isinstance(wake_word, MicroWakeWord):
                                 prob_info = ""
-                                if hasattr(wake_word, "_probabilities") and wake_word._probabilities:
-                                    prob_mean = sum(wake_word._probabilities) / len(wake_word._probabilities)
+                                if (
+                                    hasattr(wake_word, "_probabilities")
+                                    and wake_word._probabilities
+                                ):
+                                    prob_mean = sum(wake_word._probabilities) / len(
+                                        wake_word._probabilities
+                                    )
                                     prob_info = f" (prob={prob_mean:.3f}, cutoff={wake_word.probability_cutoff:.3f})"
-                                _LOGGER.info("Wake word activated: %s%s", wake_word.id, prob_info)
+                                _LOGGER.info(
+                                    "Wake word activated: %s%s", wake_word.id, prob_info
+                                )
                                 # Reset internal state to prevent re-triggering
                                 wake_word.reset()
                             else:
@@ -340,7 +360,9 @@ def process_audio(
                             if audio_ring is not None and len(audio_ring) > 0:
                                 try:
                                     ts = time.strftime("%Y%m%d_%H%M%S")
-                                    wav_path = save_wake_audio_dir / f"{wake_word.id}_{ts}.wav"
+                                    wav_path = (
+                                        save_wake_audio_dir / f"{wake_word.id}_{ts}.wav"
+                                    )
                                     with wave.open(str(wav_path), "wb") as wf:
                                         wf.setnchannels(1)
                                         wf.setsampwidth(2)
@@ -406,7 +428,9 @@ async def main() -> None:
         action="append",
         help="Directory with wake word models (.tflite) and configs (.json)",
     )
-    parser.add_argument("--wake-model", default="okay_nabu", help="Id of active wake model")
+    parser.add_argument(
+        "--wake-model", default="okay_nabu", help="Id of active wake model"
+    )
     parser.add_argument("--stop-model", default="stop", help="Id of stop model")
     parser.add_argument(
         "--refractory-seconds",
@@ -462,13 +486,17 @@ async def main() -> None:
     )
 
     # Sounds
-    parser.add_argument("--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac"))
+    parser.add_argument(
+        "--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac")
+    )
     parser.add_argument(
         "--thinking-sound",
         default=str(_SOUNDS_DIR / "thinking.flac"),
         help="Short sound to play while assistant is processing (thinking)",
     )
-    parser.add_argument("--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac"))
+    parser.add_argument(
+        "--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac")
+    )
 
     # Event sockets for external services (LED controller, etc.)
     parser.add_argument(
@@ -486,11 +514,17 @@ async def main() -> None:
 
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
 
-    parser.add_argument("--host", default="0.0.0.0",
-                        help="Address for ESPHome server (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=6053,
-                        help="Port for ESPHome server (default: 6053)")
-    parser.add_argument("--debug", action="store_true", help="Print DEBUG messages to console")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Address for ESPHome server (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=6053, help="Port for ESPHome server (default: 6053)"
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Print DEBUG messages to console"
+    )
 
     args = parser.parse_args()
 
@@ -502,6 +536,7 @@ async def main() -> None:
     for attempt in range(30):
         try:
             import soundcard as sc
+
             break
         except (AssertionError, Exception) as err:
             if attempt < 29:
@@ -524,6 +559,7 @@ async def main() -> None:
 
     if args.list_output_devices:
         from mpv import MPV
+
         player = MPV()
         print("Output devices")
         print("=" * 14)
@@ -531,7 +567,11 @@ async def main() -> None:
             print(speaker["name"] + ":", speaker["description"])
         return
 
-    if (not args.name) and (not args.list_input_devices) and (not args.list_output_devices):
+    if (
+        (not args.name)
+        and (not args.list_input_devices)
+        and (not args.list_output_devices)
+    ):
         parser.error("the following arguments are required: --name")
 
     # Resolve microphone
@@ -617,13 +657,17 @@ async def main() -> None:
     elif preferences.wakeword_threshold is not None:
         # Saved preference
         wakeword_threshold = preferences.wakeword_threshold
-        _LOGGER.debug("Using wakeword_threshold from preferences: %.2f", wakeword_threshold)
+        _LOGGER.debug(
+            "Using wakeword_threshold from preferences: %.2f", wakeword_threshold
+        )
     else:
         # Get from first loaded model (MicroWakeWord has probability_cutoff, OpenWakeWord defaults to 0.8)
         first_model = next(iter(wake_models.values()), None)
         if first_model is not None and isinstance(first_model, MicroWakeWord):
             wakeword_threshold = first_model.probability_cutoff
-            _LOGGER.debug("Using wakeword_threshold from model: %.2f", wakeword_threshold)
+            _LOGGER.debug(
+                "Using wakeword_threshold from model: %.2f", wakeword_threshold
+            )
         else:
             wakeword_threshold = 0.8  # Default for OpenWakeWord
             _LOGGER.debug("Using default wakeword_threshold: %.2f", wakeword_threshold)
@@ -651,6 +695,7 @@ async def main() -> None:
 
     # Create event sockets for external services
     from .util import create_event_sockets
+
     event_sockets = create_event_sockets(args.event_socket or [])
 
     state = ServerState(
@@ -663,7 +708,7 @@ async def main() -> None:
         active_wake_words=active_wake_words,
         stop_word=stop_model,
         music_player=None,  # will be set by satellite entities (kept for compatibility)
-        tts_player=None,    # will be set by satellite entities (kept for compatibility)
+        tts_player=None,  # will be set by satellite entities (kept for compatibility)
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
         thinking_sound=args.thinking_sound,
@@ -683,6 +728,7 @@ async def main() -> None:
     # NOTE: Mpv players are created in satellite constructor in your current repo layout.
     # If your ServerState requires them here, re-add MpvMediaPlayer imports/creation.
     from .mpv_player import MpvMediaPlayer
+
     player = MpvMediaPlayer(device=args.audio_output_device)
     state.music_player = player
     state.tts_player = player
@@ -692,9 +738,9 @@ async def main() -> None:
     player.set_volume(initial_volume)
 
     for sound_path in (
-            state.wakeup_sound,
-            state.timer_finished_sound,
-            state.thinking_sound,
+        state.wakeup_sound,
+        state.timer_finished_sound,
+        state.thinking_sound,
     ):
         if sound_path:
             state.tts_player.preload(sound_path)
@@ -715,7 +761,9 @@ async def main() -> None:
 
     def process_audio_loop() -> None:
         while True:
-            process_audio(state, mic, args.audio_input_block_size, loop, save_wake_audio_dir)
+            process_audio(
+                state, mic, args.audio_input_block_size, loop, save_wake_audio_dir
+            )
             _LOGGER.info("Restarting audio processing in 3s...")
             time.sleep(3)
 

@@ -12,7 +12,13 @@ if TYPE_CHECKING:
     from pymicro_wakeword import MicroWakeWord
     from pyopen_wakeword import OpenWakeWord
 
-    from .entity import ESPHomeEntity, MediaPlayerEntity, MuteSwitchEntity, NumberEntity, SelectEntity
+    from .entity import (
+        ESPHomeEntity,
+        MediaPlayerEntity,
+        MuteSwitchEntity,
+        NumberEntity,
+        SelectEntity,
+    )
     from .mpv_player import MpvMediaPlayer
     from .satellite import VoiceSatelliteProtocol
 
@@ -87,7 +93,7 @@ class ServerState:
 
     # Local VAD tuning (used when va_mode == "local")
     local_vad_aggressiveness: int = 2  # 0..3
-    local_vad_frame_ms: int = 30       # 10/20/30
+    local_vad_frame_ms: int = 30  # 10/20/30
     local_vad_min_speech_ms: int = 150
     local_vad_min_silence_ms: int = 600
     local_vad_start_delay_ms: int = 0  # optional "ignore first N ms" after wake

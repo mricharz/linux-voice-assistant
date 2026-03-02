@@ -5,25 +5,25 @@ from typing import Callable, List, Optional, Union
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ListEntitiesMediaPlayerResponse,
-    ListEntitiesRequest,
-    ListEntitiesSwitchResponse,
     ListEntitiesNumberResponse,
+    ListEntitiesRequest,
     ListEntitiesSelectResponse,
+    ListEntitiesSwitchResponse,
     MediaPlayerCommandRequest,
     MediaPlayerStateResponse,
-    SubscribeHomeAssistantStatesRequest,
-    SwitchCommandRequest,
-    SwitchStateResponse,
     NumberCommandRequest,
     NumberStateResponse,
     SelectCommandRequest,
     SelectStateResponse,
+    SubscribeHomeAssistantStatesRequest,
+    SwitchCommandRequest,
+    SwitchStateResponse,
 )
 from aioesphomeapi.model import (
+    EntityCategory,
     MediaPlayerCommand,
     MediaPlayerEntityFeature,
     MediaPlayerState,
-    EntityCategory,
 )
 from google.protobuf import message
 
@@ -31,15 +31,14 @@ from .api_server import APIServer
 from .mpv_player import MpvMediaPlayer
 from .util import call_all
 
-
 SUPPORTED_MEDIA_PLAYER_FEATURES = (
-        MediaPlayerEntityFeature.PLAY
-        | MediaPlayerEntityFeature.PAUSE
-        | MediaPlayerEntityFeature.STOP
-        | MediaPlayerEntityFeature.PLAY_MEDIA
-        | MediaPlayerEntityFeature.VOLUME_SET
-        | MediaPlayerEntityFeature.VOLUME_MUTE
-        | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
+    MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.STOP
+    | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
 )
 
 
@@ -57,13 +56,13 @@ class ESPHomeEntity:
 
 class MediaPlayerEntity(ESPHomeEntity):
     def __init__(
-            self,
-            server: APIServer,
-            key: int,
-            name: str,
-            object_id: str,
-            music_player: MpvMediaPlayer,
-            announce_player: MpvMediaPlayer,
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        music_player: MpvMediaPlayer,
+        announce_player: MpvMediaPlayer,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -78,10 +77,10 @@ class MediaPlayerEntity(ESPHomeEntity):
         self.announce_player = announce_player
 
     def play(
-            self,
-            url: Union[str, List[str]],
-            announcement: bool = False,
-            done_callback: Optional[Callable[[], None]] = None,
+        self,
+        url: Union[str, List[str]],
+        announcement: bool = False,
+        done_callback: Optional[Callable[[], None]] = None,
     ) -> Iterable[message.Message]:
         previous_state = self._determine_state()
 
@@ -211,13 +210,13 @@ class MediaPlayerEntity(ESPHomeEntity):
 
 class MuteSwitchEntity(ESPHomeEntity):
     def __init__(
-            self,
-            server: APIServer,
-            key: int,
-            name: str,
-            object_id: str,
-            get_muted: Callable[[], bool],
-            set_muted: Callable[[bool], None],
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        get_muted: Callable[[], bool],
+        set_muted: Callable[[bool], None],
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -260,17 +259,17 @@ class MuteSwitchEntity(ESPHomeEntity):
 
 class NumberEntity(ESPHomeEntity):
     def __init__(
-            self,
-            server: APIServer,
-            key: int,
-            name: str,
-            object_id: str,
-            get_value: Callable[[], float],
-            set_value: Callable[[float], None],
-            min_value: float,
-            max_value: float,
-            step: float,
-            icon: str = "mdi:tune-vertical",
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        get_value: Callable[[], float],
+        set_value: Callable[[float], None],
+        min_value: float,
+        max_value: float,
+        step: float,
+        icon: str = "mdi:tune-vertical",
     ) -> None:
         ESPHomeEntity.__init__(self, server)
         self.key = key
@@ -284,7 +283,7 @@ class NumberEntity(ESPHomeEntity):
         self.icon = icon
 
     def update_callbacks(
-            self, get_value: Callable[[], float], set_value: Callable[[float], None]
+        self, get_value: Callable[[], float], set_value: Callable[[float], None]
     ) -> None:
         self._get_value = get_value
         self._set_value = set_value
@@ -321,16 +320,16 @@ class SelectEntity(ESPHomeEntity):
     """
 
     def __init__(
-            self,
-            server: APIServer,
-            key: int,
-            name: str,
-            object_id: str,
-            options: List[str],
-            get_value: Callable[[], str],
-            set_value: Callable[[str], None],
-            icon: str = "mdi:format-list-bulleted",
-            entity_category: EntityCategory = EntityCategory.CONFIG,
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        options: List[str],
+        get_value: Callable[[], str],
+        set_value: Callable[[str], None],
+        icon: str = "mdi:format-list-bulleted",
+        entity_category: EntityCategory = EntityCategory.CONFIG,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
         self.key = key
@@ -343,7 +342,7 @@ class SelectEntity(ESPHomeEntity):
         self.entity_category = entity_category
 
     def update_callbacks(
-            self, get_value: Callable[[], str], set_value: Callable[[str], None]
+        self, get_value: Callable[[], str], set_value: Callable[[str], None]
     ) -> None:
         self._get_value = get_value
         self._set_value = set_value

@@ -22,11 +22,11 @@ import webrtcvad  # type: ignore  # Import at module load to avoid 3s delay on f
 @dataclass
 class LocalVADConfig:
     sample_rate: int = 16000
-    frame_ms: int = 30                 # 10/20/30
-    aggressiveness: int = 2            # 0..3
+    frame_ms: int = 30  # 10/20/30
+    aggressiveness: int = 2  # 0..3
     min_speech_ms: int = 150
     min_silence_ms: int = 600
-    start_delay_ms: int = 300            # ignore VAD for first N ms after wake (optional)
+    start_delay_ms: int = 300  # ignore VAD for first N ms after wake (optional)
 
 
 class LocalWebRTCVAD:
@@ -44,8 +44,12 @@ class LocalWebRTCVAD:
 
         self._frame_samples = int(self.cfg.sample_rate * self.cfg.frame_ms / 1000)
         self._frame_bytes = self._frame_samples * 2  # s16le mono
-        self._min_speech_frames = max(1, math.ceil(self.cfg.min_speech_ms / self.cfg.frame_ms))
-        self._min_silence_frames = max(1, math.ceil(self.cfg.min_silence_ms / self.cfg.frame_ms))
+        self._min_speech_frames = max(
+            1, math.ceil(self.cfg.min_speech_ms / self.cfg.frame_ms)
+        )
+        self._min_silence_frames = max(
+            1, math.ceil(self.cfg.min_silence_ms / self.cfg.frame_ms)
+        )
 
         self._buffer = bytearray()
         self.reset()
