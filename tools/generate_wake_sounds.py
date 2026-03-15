@@ -107,7 +107,7 @@ def generate_speech(base_url: str, profile_id: str, text: str) -> bytes:
         "input": text,
         "voice_profile_id": profile_id,
         "response_format": "flac",
-        "language": "de",
+        "language": "german",
     }
     return _api_post_audio(base_url, "/v1/audio/speech-with-profile", body)
 
