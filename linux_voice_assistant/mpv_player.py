@@ -2,10 +2,9 @@
 
 import logging
 from collections.abc import Callable
+from pathlib import Path
 from threading import Lock
 from typing import List, Optional, Set, Union
-
-from pathlib import Path
 
 from mpv import MPV
 

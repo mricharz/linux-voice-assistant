@@ -745,6 +745,12 @@ async def main() -> None:
         if sound_path:
             state.tts_player.preload(sound_path)
 
+    # Preload wakeup sound variants
+    if state.wakeup_sound:
+        _wp = Path(state.wakeup_sound)
+        for variant in _wp.parent.glob(f"{_wp.stem}_[0-9]*{_wp.suffix}"):
+            state.tts_player.preload(str(variant))
+
     # Save resolved settings back to preferences
     state.preferences.va_mode = state.va_mode
     state.preferences.wakeword_threshold = state.wakeword_threshold

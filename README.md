@@ -111,12 +111,48 @@ This is useful for LED rings, beeps, or external scripts.
 
 Wake and thinking sounds are automatically played 5% quieter than the configured volume to feel less intrusive.
 
+#### Randomized Wake Sounds
+
+Instead of playing the same wake sound every time, you can add numbered variants
+for a more natural, human-like experience. Place files next to the base sound using
+the naming pattern `<base>_1.flac`, `<base>_2.flac`, etc.:
+
+```
+sounds/
+  wake_word_triggered.flac      # default (used only if no variants exist)
+  wake_word_triggered_1.flac    # e.g. "Ja?"
+  wake_word_triggered_2.flac    # e.g. "hm?"
+  wake_word_triggered_3.flac    # e.g. "Jo!"
+  ...
+```
+
+When variants are found, one is picked at random each time. The default file is
+only used as fallback when no variants exist. You can add as many variants as you like.
+
+This also works with custom paths via `--wakeup-sound` -- just place the numbered
+variants next to the specified file.
+
+##### Generating Wake Sounds with Qwen3-TTS
+
+A helper script can generate the variant sound files using an internal Qwen3-TTS
+server. It auto-discovers the API, lets you pick a voice profile, and creates all
+files directly in the `sounds/` directory:
+
+```sh
+python3 tools/generate_wake_sounds.py [--tts-url http://HOST:PORT]
+```
+
+The script ships with ~20 short German phrases ("Ja?", "Hm?", "Schon wieder?", ...)
+and defaults to `http://172.16.5.28:8880`. Run it on the target device that has
+network access to the TTS server. Requires `ffmpeg` or `sox` for WAV-to-FLAC conversion.
+
 Example:
 
-```python3 -m linux_voice_assistant ... \
---wakeup-sound /home/hass/sounds/wakeup.wav \
---thinking-sound /home/hass/sounds/thinking.wav \
---timer-finished-sound /home/hass/sounds/timer.wav
+```sh
+python3 -m linux_voice_assistant ... \
+  --wakeup-sound /home/hass/sounds/wakeup.wav \
+  --thinking-sound /home/hass/sounds/thinking.wav \
+  --timer-finished-sound /home/hass/sounds/timer.wav
 ```
 ### Event Sockets
 
