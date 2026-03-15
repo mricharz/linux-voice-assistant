@@ -29,6 +29,7 @@ WAKE_PHRASES = [
     "Hm?",
     "Jo!",
     "Was?",
+    "Was!",
     "Jup!",
     "Was los?",
     "Mhm?",
@@ -36,7 +37,6 @@ WAKE_PHRASES = [
     "Jaaa?",
     "Was gibt's?",
     "Yo?",
-    "Schon wieder?",
     "Na?",
     "Was denn?",
     "Ja bitte?",
@@ -44,7 +44,7 @@ WAKE_PHRASES = [
     "Sag an!",
     "Was willst du?",
     "Bin da!",
-    "Jetzt schon wieder?",
+    "Anwesend!"
 ]
 
 DEFAULT_TTS_URL = "http://172.16.5.28:8880"
