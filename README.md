@@ -135,16 +135,17 @@ variants next to the specified file.
 ##### Generating Wake Sounds with Qwen3-TTS
 
 A helper script can generate the variant sound files using an internal Qwen3-TTS
-server. It auto-discovers the API, lets you pick a voice profile, and creates all
+server. It lists your cloned voice profiles, lets you pick one, and creates all
 files directly in the `sounds/` directory:
 
 ```sh
 python3 tools/generate_wake_sounds.py [--tts-url http://HOST:PORT]
 ```
 
-The script ships with ~20 short German phrases ("Ja?", "Hm?", "Schon wieder?", ...)
+The script ships with ~20 short German phrases ("Ja?", "Hm?", "Sag an!", ...)
 and defaults to `http://172.16.5.28:8880`. Run it on the target device that has
-network access to the TTS server. Requires `ffmpeg` or `sox` for WAV-to-FLAC conversion.
+network access to the TTS server. Voice profiles must be created beforehand via
+the TTS web UI.
 
 Example:
 
