@@ -101,13 +101,16 @@ def select_profile(profiles: list) -> dict:
             sys.exit(1)
 
 
-def generate_speech(base_url: str, profile_id: str, text: str) -> bytes:
+def generate_speech(
+    base_url: str, profile_id: str, text: str, speed: float = 1.0
+) -> bytes:
     """Generate speech using a cloned voice profile, returns FLAC audio."""
     body = {
         "input": text,
         "voice_profile_id": profile_id,
         "response_format": "flac",
         "language": "german",
+        "speed": speed,
     }
     return _api_post_audio(base_url, "/v1/audio/speech-with-profile", body)
 
@@ -126,6 +129,12 @@ def main() -> None:
         type=Path,
         default=_SOUNDS_DIR,
         help=f"Output directory (default: {_SOUNDS_DIR})",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=0.9,
+        help="Speech speed 0.25-4.0 (default: 0.9)",
     )
     args = parser.parse_args()
 
@@ -157,7 +166,7 @@ def main() -> None:
         out_path = args.output_dir / f"wake_word_triggered_{i}.flac"
 
         try:
-            audio_data = generate_speech(args.tts_url, profile_id, phrase)
+            audio_data = generate_speech(args.tts_url, profile_id, phrase, args.speed)
         except Exception as exc:
             print(f"  [{i:2d}/{len(WAKE_PHRASES)}] FAILED  {phrase!r}: {exc}")
             continue
