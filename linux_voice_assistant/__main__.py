@@ -22,6 +22,7 @@ from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
 from .util import get_mac
+from .wyoming_client import WyomingClient, WyomingClientConfig
 from .zeroconf import HomeAssistantZeroconf
 
 _LOGGER = logging.getLogger(__name__)
@@ -158,6 +159,10 @@ def process_audio(
     last_va_mode: Optional[str] = None
     last_pipeline_active: bool = False
 
+    # Realtime mode: VAD-based speech segmentation for Wyoming streaming
+    realtime_vad: Optional[LocalWebRTCVAD] = None
+    realtime_utterance_active: bool = False
+
     try:
         _LOGGER.debug("Opening audio input device: %s", mic.name)
         with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
@@ -180,6 +185,36 @@ def process_audio(
                     continue
 
                 if state.muted:
+                    continue
+
+                # Realtime mode: stream audio to Wyoming client with VAD segmentation
+                if getattr(state, "jarvis_mode", "wakeword") == "realtime":
+                    wyoming_client = getattr(state, "_wyoming_client", None)
+                    if wyoming_client is not None and wyoming_client.connected:
+                        # Lazy init VAD for realtime speech segmentation
+                        if realtime_vad is None:
+                            realtime_vad = LocalWebRTCVAD(LocalVADConfig(
+                                sample_rate=16000,
+                                frame_ms=30,
+                                aggressiveness=2,
+                                min_speech_ms=150,
+                                min_silence_ms=800,
+                                start_delay_ms=0,
+                            ))
+
+                        for ev in realtime_vad.process(audio_chunk, allow_vad=True):
+                            if ev == "vad_start":
+                                _LOGGER.debug("Realtime VAD: speech start")
+                                loop.call_soon_threadsafe(wyoming_client.start_utterance)
+                                realtime_utterance_active = True
+                            elif ev == "vad_end":
+                                _LOGGER.debug("Realtime VAD: speech end")
+                                loop.call_soon_threadsafe(wyoming_client.end_utterance)
+                                realtime_utterance_active = False
+
+                        # Stream audio during active utterance
+                        if realtime_utterance_active:
+                            loop.call_soon_threadsafe(wyoming_client.send_audio, audio_chunk)
                     continue
 
                 streaming = getattr(sat, "is_streaming_audio", False)
@@ -485,6 +520,30 @@ async def main() -> None:
         help="Ignore VAD for first N ms after wake (helps filter wake beep echo). [experimental]",
     )
 
+    # Jarvis mode (wakeword vs. realtime)
+    parser.add_argument(
+        "--jarvis-mode",
+        choices=("wakeword", "realtime"),
+        default=None,
+        help="Jarvis mode: 'wakeword' (default) or 'realtime' (continuous STT via Wyoming/Parakeet)",
+    )
+    parser.add_argument(
+        "--parakeet-host",
+        default="172.16.5.35",
+        help="Parakeet Wyoming STT server host (default: 172.16.5.35)",
+    )
+    parser.add_argument(
+        "--parakeet-port",
+        type=int,
+        default=10300,
+        help="Parakeet Wyoming STT server port (default: 10300)",
+    )
+    parser.add_argument(
+        "--satellite-id",
+        default="",
+        help="Satellite ID sent to Wyoming server for identification",
+    )
+
     # Sounds
     parser.add_argument(
         "--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac")
@@ -627,6 +686,11 @@ async def main() -> None:
     if va_mode not in ("ha", "local"):
         va_mode = "ha"
 
+    # Determine initial Jarvis mode (CLI overrides preferences)
+    jarvis_mode = (args.jarvis_mode or getattr(preferences, "jarvis_mode", None) or "wakeword").strip().lower()
+    if jarvis_mode not in ("wakeword", "realtime"):
+        jarvis_mode = "wakeword"
+
     # Load wake/stop models
     active_wake_words: Set[str] = set()
     wake_models: Dict[str, Union[MicroWakeWord, OpenWakeWord]] = {}
@@ -717,6 +781,10 @@ async def main() -> None:
         refractory_seconds=args.refractory_seconds,
         wakeword_threshold=wakeword_threshold,
         va_mode=va_mode,
+        jarvis_mode=jarvis_mode,
+        satellite_id=args.satellite_id,
+        parakeet_host=args.parakeet_host,
+        parakeet_port=args.parakeet_port,
         local_vad_aggressiveness=args.local_vad_aggressiveness,
         local_vad_frame_ms=args.local_vad_frame_ms,
         local_vad_min_speech_ms=args.local_vad_min_speech_ms,
@@ -753,11 +821,28 @@ async def main() -> None:
 
     # Save resolved settings back to preferences
     state.preferences.va_mode = state.va_mode
+    state.preferences.jarvis_mode = state.jarvis_mode
     state.preferences.wakeword_threshold = state.wakeword_threshold
     try:
         state.save_preferences()
     except Exception:
         _LOGGER.exception("Failed to save preferences at startup")
+
+    # Start Wyoming realtime client if jarvis_mode == "realtime"
+    if state.jarvis_mode == "realtime":
+        _LOGGER.info("Starting Wyoming realtime client (mode=realtime)")
+        wyoming_config = WyomingClientConfig(
+            host=state.parakeet_host,
+            port=state.parakeet_port,
+            satellite_id=state.satellite_id,
+        )
+
+        def _on_transcript(text: str) -> None:
+            _LOGGER.info("Realtime transcript: %s", text)
+
+        wyoming_rt_client = WyomingClient(wyoming_config, on_transcript=_on_transcript)
+        state._wyoming_client = wyoming_rt_client  # type: ignore[attr-defined]
+        await wyoming_rt_client.start()
 
     save_wake_audio_dir: Optional[Path] = (
         Path(args.save_wake_audio_dir) if args.save_wake_audio_dir else None
@@ -817,6 +902,14 @@ async def main() -> None:
             except Full:
                 pass
         sender_thread.join(timeout=2.0)
+
+        # Stop Wyoming client if running
+        wyoming_rt = getattr(state, "_wyoming_client", None)
+        if wyoming_rt is not None:
+            try:
+                await wyoming_rt.stop()
+            except Exception:
+                _LOGGER.exception("Failed to stop Wyoming client during shutdown")
 
         # Terminate mpv player
         player.terminate()

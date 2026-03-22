@@ -211,6 +211,26 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.state.va_mode_entity.server = self
 
+        # Jarvis mode dropdown (wakeword / realtime)
+        jarvis_mode_entity = self.state.jarvis_mode_entity
+        if jarvis_mode_entity is None:
+            jarvis_mode_entity = SelectEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Jarvis Mode",
+                object_id="jarvis_mode",
+                options=["wakeword", "realtime"],
+                get_value=lambda: self.state.jarvis_mode,
+                set_value=self.set_jarvis_mode,
+                icon="mdi:microphone-settings",
+            )
+            self.state.entities.append(jarvis_mode_entity)
+            self.state.jarvis_mode_entity = jarvis_mode_entity
+        elif jarvis_mode_entity not in self.state.entities:
+            self.state.entities.append(jarvis_mode_entity)
+
+        self.state.jarvis_mode_entity.server = self
+
         # Volume slider (0-100%)
         volume_entity = self.state.volume_entity
         if volume_entity is None:
@@ -276,6 +296,68 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.save_preferences()
         except Exception:
             _LOGGER.exception("Failed to save preferences after VAD mode change")
+
+    def set_jarvis_mode(self, new_mode: str) -> None:
+        """Switch between wakeword and realtime mode.
+
+        In realtime mode, audio is streamed to the Wyoming STT server (Parakeet)
+        instead of waiting for a wake word trigger. The Wyoming client is started
+        or stopped accordingly.
+        """
+        new_mode = str(new_mode).strip().lower()
+        if new_mode not in ("wakeword", "realtime"):
+            _LOGGER.warning("Ignoring invalid jarvis mode: %s", new_mode)
+            return
+
+        if self.state.jarvis_mode == new_mode:
+            return
+
+        _LOGGER.info("Jarvis mode set to: %s", new_mode)
+        self.state.jarvis_mode = new_mode
+        self.state.preferences.jarvis_mode = new_mode
+        try:
+            self.state.save_preferences()
+        except Exception:
+            _LOGGER.exception("Failed to save preferences after jarvis mode change")
+
+        # Start/stop Wyoming client based on mode
+        self._manage_wyoming_client(new_mode)
+
+    def _manage_wyoming_client(self, mode: str) -> None:
+        """Start or stop the Wyoming realtime client based on mode."""
+        from .wyoming_client import WyomingClient, WyomingClientConfig
+
+        loop = self._loop
+        if loop is None:
+            _LOGGER.warning("No event loop available to manage Wyoming client")
+            return
+
+        wyoming_client = getattr(self.state, "_wyoming_client", None)
+
+        if mode == "realtime":
+            if wyoming_client is not None and wyoming_client.connected:
+                _LOGGER.debug("Wyoming client already running")
+                return
+
+            config = WyomingClientConfig(
+                host=self.state.parakeet_host,
+                port=self.state.parakeet_port,
+                satellite_id=self.state.satellite_id,
+            )
+
+            def _on_transcript(text: str) -> None:
+                _LOGGER.info("Realtime transcript: %s", text)
+
+            client = WyomingClient(config, on_transcript=_on_transcript)
+            self.state._wyoming_client = client  # type: ignore[attr-defined]
+            asyncio.ensure_future(client.start(), loop=loop)
+            _LOGGER.info("Wyoming realtime client started")
+
+        elif mode == "wakeword":
+            if wyoming_client is not None:
+                asyncio.ensure_future(wyoming_client.stop(), loop=loop)
+                self.state._wyoming_client = None  # type: ignore[attr-defined]
+                _LOGGER.info("Wyoming realtime client stopped")
 
     def set_wakeword_threshold(self, new_threshold: float) -> None:
         """Update wakeword threshold (called from HA number entity)."""

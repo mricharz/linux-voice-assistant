@@ -63,6 +63,9 @@ class Preferences:
     # - "local": use local WebRTC VAD to cut mic earlier (faster, less waiting)
     va_mode: str = "ha"
 
+    # Jarvis mode: "wakeword" (default) or "realtime" (continuous STT via Wyoming)
+    jarvis_mode: str = "wakeword"
+
     # Output volume (0-100%)
     volume: int = 100
 
@@ -90,6 +93,12 @@ class ServerState:
 
     # Mode/config (runtime)
     va_mode: str = "ha"
+    jarvis_mode: str = "wakeword"
+
+    # Wyoming/Parakeet realtime STT settings
+    satellite_id: str = ""
+    parakeet_host: str = "172.16.5.35"
+    parakeet_port: int = 10300
 
     # Local VAD tuning (used when va_mode == "local")
     local_vad_aggressiveness: int = 2  # 0..3
@@ -104,6 +113,7 @@ class ServerState:
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None
     threshold_entity: "Optional[NumberEntity]" = None
     va_mode_entity: "Optional[SelectEntity]" = None
+    jarvis_mode_entity: "Optional[SelectEntity]" = None
     volume_entity: "Optional[NumberEntity]" = None
 
     # Wakeword/runtime state
