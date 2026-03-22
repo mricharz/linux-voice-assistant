@@ -211,6 +211,10 @@ def process_audio(
                                 _LOGGER.debug("Realtime VAD: speech end")
                                 loop.call_soon_threadsafe(wyoming_client.end_utterance)
                                 realtime_utterance_active = False
+                                # Reset VAD state so it can detect the next utterance.
+                                # Without this, _speech_ended stays True and the VAD
+                                # silently ignores all subsequent audio.
+                                realtime_vad.reset()
 
                         # Stream audio during active utterance
                         if realtime_utterance_active:
