@@ -124,6 +124,7 @@ def process_audio(
     block_size: int,
     loop: asyncio.AbstractEventLoop,
     save_wake_audio_dir: Optional[Path] = None,
+    realtime_prebuffer_ms: int = 300,
 ) -> None:
     """Process audio chunks from the microphone.
 
@@ -162,6 +163,15 @@ def process_audio(
     # Realtime mode: VAD-based speech segmentation for Wyoming streaming
     realtime_vad: Optional[LocalWebRTCVAD] = None
     realtime_utterance_active: bool = False
+
+    # Pre-buffer: keep last N ms of audio to prepend when VAD triggers
+    # This captures onset consonants (e.g. "J" in "Jarvis") that are
+    # lost during the ~150ms VAD needs to confirm speech.
+    prebuffer_samples = int(realtime_prebuffer_ms * 16)  # 16 samples per ms at 16kHz
+    prebuffer_bytes = prebuffer_samples * 2  # 2 bytes per sample (s16le)
+    realtime_prebuffer: deque = deque()
+    realtime_prebuffer_max_bytes = prebuffer_bytes
+    realtime_prebuffer_current_bytes = 0
 
     try:
         _LOGGER.debug("Opening audio input device: %s", mic.name)
@@ -202,15 +212,34 @@ def process_audio(
                                 start_delay_ms=0,
                             ))
 
+                        # Always accumulate audio in the pre-buffer (ring buffer)
+                        if not realtime_utterance_active:
+                            realtime_prebuffer.append(audio_chunk)
+                            realtime_prebuffer_current_bytes += len(audio_chunk)
+                            # Drop oldest chunks when exceeding max size
+                            while realtime_prebuffer_current_bytes > realtime_prebuffer_max_bytes:
+                                dropped = realtime_prebuffer.popleft()
+                                realtime_prebuffer_current_bytes -= len(dropped)
+
                         for ev in realtime_vad.process(audio_chunk, allow_vad=True):
                             if ev == "vad_start":
-                                _LOGGER.debug("Realtime VAD: speech start")
+                                _LOGGER.debug(
+                                    "Realtime VAD: speech start (flushing %d ms pre-buffer)",
+                                    realtime_prebuffer_current_bytes // 32,  # bytes to ms at 16kHz s16le
+                                )
                                 loop.call_soon_threadsafe(wyoming_client.start_utterance)
+                                # Flush pre-buffered audio before streaming new chunks
+                                for buffered_chunk in realtime_prebuffer:
+                                    loop.call_soon_threadsafe(wyoming_client.send_audio, buffered_chunk)
+                                realtime_prebuffer.clear()
+                                realtime_prebuffer_current_bytes = 0
                                 realtime_utterance_active = True
                             elif ev == "vad_end":
                                 _LOGGER.debug("Realtime VAD: speech end")
                                 loop.call_soon_threadsafe(wyoming_client.end_utterance)
                                 realtime_utterance_active = False
+                                realtime_prebuffer.clear()
+                                realtime_prebuffer_current_bytes = 0
                                 # Reset VAD state so it can detect the next utterance.
                                 # Without this, _speech_ended stays True and the VAD
                                 # silently ignores all subsequent audio.
@@ -547,6 +576,12 @@ async def main() -> None:
         default="",
         help="Satellite ID sent to Wyoming server for identification",
     )
+    parser.add_argument(
+        "--realtime-prebuffer-ms",
+        type=int,
+        default=300,
+        help="Pre-buffer duration in ms to prepend on VAD trigger (captures onset consonants). Default: 300",
+    )
 
     # Sounds
     parser.add_argument(
@@ -857,7 +892,8 @@ async def main() -> None:
     def process_audio_loop() -> None:
         while True:
             process_audio(
-                state, mic, args.audio_input_block_size, loop, save_wake_audio_dir
+                state, mic, args.audio_input_block_size, loop, save_wake_audio_dir,
+                realtime_prebuffer_ms=args.realtime_prebuffer_ms,
             )
             _LOGGER.info("Restarting audio processing in 3s...")
             time.sleep(3)
