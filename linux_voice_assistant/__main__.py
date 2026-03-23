@@ -21,11 +21,13 @@ from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
+from .otel_setup import get_tracer, init_tracing, shutdown_tracing
 from .util import get_mac
 from .wyoming_client import WyomingClient, WyomingClientConfig
 from .zeroconf import HomeAssistantZeroconf
 
 _LOGGER = logging.getLogger(__name__)
+_otel_tracer = get_tracer(__name__)
 _MODULE_DIR = Path(__file__).parent
 _REPO_DIR = _MODULE_DIR.parent
 _WAKEWORDS_DIR = _REPO_DIR / "wakewords"
@@ -163,6 +165,9 @@ def process_audio(
     # Realtime mode: VAD-based speech segmentation for Wyoming streaming
     realtime_vad: Optional[LocalWebRTCVAD] = None
     realtime_utterance_active: bool = False
+    # OTel context manager and span for the current realtime utterance (vad_start → vad_end)
+    realtime_utterance_span_ctx = None
+    realtime_utterance_span = None
 
     # Pre-buffer: keep last N ms of audio to prepend when VAD triggers
     # This captures onset consonants (e.g. "J" in "Jarvis") that are
@@ -223,10 +228,23 @@ def process_audio(
 
                         for ev in realtime_vad.process(audio_chunk, allow_vad=True):
                             if ev == "vad_start":
+                                prebuf_ms = realtime_prebuffer_current_bytes // 32  # bytes to ms at 16kHz s16le
                                 _LOGGER.debug(
                                     "Realtime VAD: speech start (flushing %d ms pre-buffer)",
-                                    realtime_prebuffer_current_bytes // 32,  # bytes to ms at 16kHz s16le
+                                    prebuf_ms,
                                 )
+                                # Start OTel span for the utterance lifecycle
+                                realtime_utterance_span_ctx = _otel_tracer.start_as_current_span(
+                                    "realtime.utterance"
+                                )
+                                realtime_utterance_span = realtime_utterance_span_ctx.__enter__()
+                                # Record pre-buffer size as span attribute
+                                try:
+                                    realtime_utterance_span.set_attribute(
+                                        "vad.prebuffer_ms", prebuf_ms
+                                    )
+                                except AttributeError:
+                                    pass
                                 loop.call_soon_threadsafe(wyoming_client.start_utterance)
                                 # Flush pre-buffered audio before streaming new chunks
                                 for buffered_chunk in realtime_prebuffer:
@@ -237,6 +255,14 @@ def process_audio(
                             elif ev == "vad_end":
                                 _LOGGER.debug("Realtime VAD: speech end")
                                 loop.call_soon_threadsafe(wyoming_client.end_utterance)
+                                # End OTel utterance span
+                                if realtime_utterance_span_ctx is not None:
+                                    try:
+                                        realtime_utterance_span_ctx.__exit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                    realtime_utterance_span_ctx = None
+                                    realtime_utterance_span = None
                                 realtime_utterance_active = False
                                 realtime_prebuffer.clear()
                                 realtime_prebuffer_current_bytes = 0
@@ -630,6 +656,13 @@ async def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
 
+    # Initialise OpenTelemetry tracing (no-op when OTEL_ENABLED != "true")
+    otel_active = init_tracing()
+    if otel_active:
+        global _otel_tracer
+        from .otel_setup import get_tracer as _get_tracer
+        _otel_tracer = _get_tracer(__name__)
+
     # Import soundcard with retry - PulseAudio may not be ready yet after boot
     sc = None
     for attempt in range(30):
@@ -961,6 +994,9 @@ async def main() -> None:
                 sock.close()
             except Exception:
                 pass
+
+        # Flush pending OTel spans before exit
+        shutdown_tracing()
 
         _LOGGER.debug("Server stopped")
 

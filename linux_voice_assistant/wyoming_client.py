@@ -17,7 +17,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
+from .otel_setup import get_tracer, get_current_trace_context
+
 _LOGGER = logging.getLogger(__name__)
+_otel_tracer = get_tracer("wyoming_client")
 
 # Wyoming event type constants
 _EVENT_INFO = "info"
@@ -176,13 +179,18 @@ class WyomingClient:
 
         self._utterance_active = True
         # Send audio-start with format info (16kHz, 16-bit, mono)
+        # Include W3C trace context for downstream propagation
+        audio_start_data: Dict[str, Any] = {
+            "rate": 16000,
+            "width": 2,
+            "channels": 1,
+        }
+        trace_ctx = get_current_trace_context()
+        if trace_ctx:
+            audio_start_data["traceparent"] = trace_ctx.get("traceparent", "")
         event_bytes = _build_event(
             _EVENT_AUDIO_START,
-            data={
-                "rate": 16000,
-                "width": 2,
-                "channels": 1,
-            },
+            data=audio_start_data,
         )
         self._write_raw(event_bytes)
         _LOGGER.debug("Wyoming: utterance started")
@@ -209,8 +217,9 @@ class WyomingClient:
             return
 
         self._utterance_active = False
-        event_bytes = _build_event(_EVENT_AUDIO_STOP)
-        self._write_raw(event_bytes)
+        with _otel_tracer.start_as_current_span("wyoming.end_utterance"):
+            event_bytes = _build_event(_EVENT_AUDIO_STOP)
+            self._write_raw(event_bytes)
         _LOGGER.debug("Wyoming: utterance ended")
 
     # -----------------------------------------------------------------
