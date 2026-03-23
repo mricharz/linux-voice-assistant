@@ -248,6 +248,7 @@ def process_audio(
                         # Stream audio during active utterance
                         if realtime_utterance_active:
                             loop.call_soon_threadsafe(wyoming_client.send_audio, audio_chunk)
+                    # Always skip wake word inference in realtime mode — Parakeet handles detection
                     continue
 
                 streaming = getattr(sat, "is_streaming_audio", False)
