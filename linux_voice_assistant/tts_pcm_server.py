@@ -203,6 +203,10 @@ class TtsPcmServer:
         peer = writer.get_extra_info("peername")
         _LOGGER.info("TTS PCM client connected: %s", peer)
 
+        async def _read_exact(n: int) -> bytes:
+            """readexactly with 60s timeout."""
+            return await asyncio.wait_for(reader.readexactly(n), timeout=60.0)
+
         # New connection cancels any active playback session
         async with self._lock:
             if self._active_task is not None and not self._active_task.done():
@@ -238,7 +242,13 @@ class TtsPcmServer:
             # Outer loop: persistent connection, handles multiple sessions
             while True:
                 # Wait for START command
-                msg_type_bytes = await reader.readexactly(1)
+                try:
+                    msg_type_bytes = await _read_exact(1)
+                except asyncio.TimeoutError:
+                    # Idle connection — no START received in 60s, keep waiting
+                    # This prevents hanging forever if Response Handler dies mid-protocol
+                    _LOGGER.debug("TTS PCM: idle timeout, still connected")
+                    continue
                 msg_type = msg_type_bytes[0]
 
                 if msg_type != _MSG_START:
@@ -246,7 +256,7 @@ class TtsPcmServer:
                     continue
 
                 # Read sample rate (4 bytes, u32 LE)
-                sr_bytes = await reader.readexactly(4)
+                sr_bytes = await _read_exact(4)
                 sample_rate = struct.unpack("<I", sr_bytes)[0]
                 session_start_ts = time.monotonic()
                 _LOGGER.info("Playback START: sample_rate=%d", sample_rate)
@@ -272,11 +282,11 @@ class TtsPcmServer:
                 self._active_playback = playback
 
                 # Peek next byte for optional METADATA
-                next_byte = await reader.readexactly(1)
+                next_byte = await _read_exact(1)
                 if next_byte[0] == _MSG_METADATA:
-                    meta_len_bytes = await reader.readexactly(4)
+                    meta_len_bytes = await _read_exact(4)
                     meta_len = struct.unpack("<I", meta_len_bytes)[0]
-                    meta_json_bytes = await reader.readexactly(meta_len)
+                    meta_json_bytes = await _read_exact(meta_len)
                     try:
                         metadata = json.loads(meta_json_bytes)
                         _LOGGER.debug("Received METADATA: %s", metadata)
@@ -284,7 +294,7 @@ class TtsPcmServer:
                     except (json.JSONDecodeError, Exception):
                         _LOGGER.warning("Failed to parse METADATA JSON, ignoring")
                     # Read the actual first message after metadata
-                    next_byte = await reader.readexactly(1)
+                    next_byte = await _read_exact(1)
 
                 # Start OTel session span
                 span_kwargs: dict = {"attributes": {"pcm.sample_rate": sample_rate}}
@@ -298,9 +308,9 @@ class TtsPcmServer:
                 inner_msg_type = next_byte[0]
                 while True:
                     if inner_msg_type == _MSG_PCM_DATA:
-                        len_bytes = await reader.readexactly(4)
+                        len_bytes = await _read_exact(4)
                         length = struct.unpack("<I", len_bytes)[0]
-                        pcm_data = await reader.readexactly(length)
+                        pcm_data = await _read_exact(length)
                         if playback is not None:
                             chunks_received += 1
                             bytes_total += length
@@ -343,9 +353,11 @@ class TtsPcmServer:
                         _LOGGER.warning("Unexpected message type 0x%02x during session", inner_msg_type)
 
                     # Read next message for inner loop
-                    next_msg = await reader.readexactly(1)
+                    next_msg = await _read_exact(1)
                     inner_msg_type = next_msg[0]
 
+        except asyncio.TimeoutError:
+            _LOGGER.warning("TTS PCM: read timeout during session, ending: %s", peer)
         except asyncio.IncompleteReadError:
             _LOGGER.warning("TTS PCM client disconnected: %s", peer)
         except asyncio.CancelledError:

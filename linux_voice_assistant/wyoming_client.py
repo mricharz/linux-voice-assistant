@@ -40,9 +40,12 @@ class WyomingClientConfig:
 
     # Reconnect settings
     reconnect_min_delay: float = 1.0
-    reconnect_max_delay: float = 30.0
+    reconnect_max_delay: float = 300.0
     reconnect_multiplier: float = 2.0
     reconnect_jitter: float = 0.5
+
+    # Read timeout — reconnect if nothing received within this period
+    read_timeout: float = 60.0
 
 
 def _build_event(
@@ -121,9 +124,11 @@ class WyomingClient:
         self,
         config: WyomingClientConfig,
         on_transcript: Optional[Callable[[str], None]] = None,
+        on_connection_state: Optional[Callable[[bool], None]] = None,
     ) -> None:
         self._config = config
         self._on_transcript = on_transcript
+        self._on_connection_state = on_connection_state
 
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -226,6 +231,14 @@ class WyomingClient:
     # Internal
     # -----------------------------------------------------------------
 
+    def _notify_connection_state(self, connected: bool) -> None:
+        """Notify listener of connection state change."""
+        if self._on_connection_state is not None:
+            try:
+                self._on_connection_state(connected)
+            except Exception:
+                _LOGGER.exception("Error in connection state callback")
+
     def _write_raw(self, data: bytes) -> None:
         """Write raw bytes to the TCP stream (non-blocking)."""
         if self._writer is None:
@@ -241,6 +254,7 @@ class WyomingClient:
         delay = self._config.reconnect_min_delay
 
         while self._running:
+            connect_time = time.monotonic()
             try:
                 await self._connect_and_listen()
             except asyncio.CancelledError:
@@ -250,8 +264,20 @@ class WyomingClient:
                     "Wyoming connection lost, reconnecting in %.1fs", delay
                 )
 
+            # Clean up connection + emit disconnect LED event
+            was_connected = self._connected
+            await self._close_connection()
+            if was_connected:
+                self._notify_connection_state(False)
+
             if not self._running:
                 break
+
+            # Reset backoff only if connection was stable (lasted >10s)
+            elapsed = time.monotonic() - connect_time
+            if elapsed > 10.0:
+                delay = self._config.reconnect_min_delay
+                _LOGGER.info("Wyoming: backoff reset (connection lasted %.1fs)", elapsed)
 
             # Exponential backoff with jitter
             jitter = random.uniform(
@@ -259,8 +285,6 @@ class WyomingClient:
             )
             await asyncio.sleep(max(0.1, delay + jitter))
             delay = min(delay * self._config.reconnect_multiplier, self._config.reconnect_max_delay)
-
-        await self._close_connection()
 
     async def _connect_and_listen(self) -> None:
         """Open TCP connection, send info event, then listen for responses."""
@@ -274,6 +298,7 @@ class WyomingClient:
             self._config.host, self._config.port
         )
         self._connected = True
+        self._notify_connection_state(True)
 
         # Reset backoff on successful connect
         _LOGGER.info("Wyoming: connected to %s:%d", self._config.host, self._config.port)
@@ -295,7 +320,17 @@ class WyomingClient:
 
         while self._running and self._connected:
             try:
-                event = await _read_event(self._reader)
+                event = await asyncio.wait_for(
+                    _read_event(self._reader),
+                    timeout=self._config.read_timeout,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Wyoming: read timeout (%.0fs), reconnecting",
+                    self._config.read_timeout,
+                )
+                self._connected = False
+                break
             except (asyncio.IncompleteReadError, ConnectionError):
                 _LOGGER.warning("Wyoming: connection closed by server")
                 self._connected = False

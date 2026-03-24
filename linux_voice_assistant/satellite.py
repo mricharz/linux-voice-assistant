@@ -348,7 +348,19 @@ class VoiceSatelliteProtocol(APIServer):
             def _on_transcript(text: str) -> None:
                 _LOGGER.info("Realtime transcript: %s", text)
 
-            client = WyomingClient(config, on_transcript=_on_transcript)
+            def _on_connection_state(connected: bool) -> None:
+                if connected:
+                    _LOGGER.info("Wyoming: connected — emitting ready LED")
+                    emit_event(self.state, "ready")
+                else:
+                    _LOGGER.warning("Wyoming: disconnected — emitting error LED")
+                    emit_event(self.state, "error")
+
+            client = WyomingClient(
+                config,
+                on_transcript=_on_transcript,
+                on_connection_state=_on_connection_state,
+            )
             self.state._wyoming_client = client  # type: ignore[attr-defined]
             asyncio.ensure_future(client.start(), loop=loop)
             _LOGGER.info("Wyoming realtime client started")
