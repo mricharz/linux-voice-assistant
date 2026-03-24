@@ -217,200 +217,154 @@ class TtsPcmServer:
         task = asyncio.current_task()
         self._active_task = task
 
-        playback: Optional[_PulsePlayback] = None
         loop = asyncio.get_running_loop()
 
-        # OTel session span (created after START, optionally linked to remote context)
-        session_span: Any = None
-        session_span_ctx: Any = None
-        remote_context: Any = None
-
-        # Playback metrics
-        sample_rate: int = 0
-        chunks_received: int = 0
-        bytes_total: int = 0
-        first_audio_written: bool = False
-        first_audio_ts: float = 0.0
-        session_start_ts: float = 0.0
+        def _end_session(playback, session_span, session_span_ctx, session_start_ts,
+                         chunks_received, bytes_total, drain: bool):
+            """Clean up a playback session (PulseAudio + OTel span). Connection stays open."""
+            duration_ms = (time.monotonic() - session_start_ts) * 1000 if session_start_ts else 0
+            if session_span is not None:
+                session_span.set_attribute("pcm.chunks_received", chunks_received)
+                session_span.set_attribute("pcm.bytes_total", bytes_total)
+                session_span.set_attribute("pcm.duration_ms", duration_ms)
+            if session_span_ctx is not None:
+                try:
+                    session_span_ctx.__exit__(None, None, None)
+                except Exception:
+                    _LOGGER.debug("Error ending OTel session span", exc_info=True)
+            return duration_ms
 
         try:
+            # Outer loop: persistent connection, handles multiple sessions
             while True:
-                # Read message type (1 byte)
+                # Wait for START command
                 msg_type_bytes = await reader.readexactly(1)
                 msg_type = msg_type_bytes[0]
 
-                if msg_type == _MSG_START:
-                    # Read sample rate (4 bytes, u32 LE)
-                    sr_bytes = await reader.readexactly(4)
-                    sample_rate = struct.unpack("<I", sr_bytes)[0]
-                    session_start_ts = time.monotonic()
-                    _LOGGER.info("Playback START: sample_rate=%d", sample_rate)
+                if msg_type != _MSG_START:
+                    _LOGGER.warning("Expected START (0x01), got 0x%02x, ignoring", msg_type)
+                    continue
 
-                    # Clean up previous playback if any
-                    if playback is not None:
-                        await loop.run_in_executor(None, playback.free)
+                # Read sample rate (4 bytes, u32 LE)
+                sr_bytes = await reader.readexactly(4)
+                sample_rate = struct.unpack("<I", sr_bytes)[0]
+                session_start_ts = time.monotonic()
+                _LOGGER.info("Playback START: sample_rate=%d", sample_rate)
 
-                    # Reset metrics for new session
-                    chunks_received = 0
-                    bytes_total = 0
-                    first_audio_written = False
+                # Session state
+                playback: Optional[_PulsePlayback] = None
+                session_span: Any = None
+                session_span_ctx: Any = None
+                remote_context: Any = None
+                chunks_received = 0
+                bytes_total = 0
+                first_audio_written = False
 
-                    # Try configured sink, fall back to default
-                    try:
-                        playback = _PulsePlayback(sample_rate, sink=self._sink)
-                    except RuntimeError:
-                        if self._sink is not None:
-                            _LOGGER.warning(
-                                "Sink '%s' unavailable, falling back to default",
-                                self._sink,
-                            )
-                            playback = _PulsePlayback(sample_rate, sink=None)
-                        else:
-                            raise
-                    self._active_playback = playback
-
-                    # Peek next byte to check for optional METADATA packet
-                    next_byte = await reader.readexactly(1)
-                    if next_byte[0] == _MSG_METADATA:
-                        # Parse METADATA: 4 bytes length (u32 LE) + JSON bytes
-                        meta_len_bytes = await reader.readexactly(4)
-                        meta_len = struct.unpack("<I", meta_len_bytes)[0]
-                        meta_json_bytes = await reader.readexactly(meta_len)
-                        try:
-                            metadata = json.loads(meta_json_bytes)
-                            _LOGGER.debug("Received METADATA: %s", metadata)
-                            remote_context = self._extract_remote_context(metadata)
-                        except (json.JSONDecodeError, Exception):
-                            _LOGGER.warning("Failed to parse METADATA JSON, ignoring")
+                # Open PulseAudio stream
+                try:
+                    playback = _PulsePlayback(sample_rate, sink=self._sink)
+                except RuntimeError:
+                    if self._sink is not None:
+                        _LOGGER.warning("Sink '%s' unavailable, falling back to default", self._sink)
+                        playback = _PulsePlayback(sample_rate, sink=None)
                     else:
-                        # Not METADATA — push byte back by prepending to internal buffer
-                        # We handle this by processing it as a regular message type
-                        msg_type = next_byte[0]
-                        # Process this message inline (fall through below)
-                        if msg_type == _MSG_PCM_DATA:
-                            len_bytes = await reader.readexactly(4)
-                            length = struct.unpack("<I", len_bytes)[0]
-                            pcm_data = await reader.readexactly(length)
-                            if playback is not None:
-                                chunks_received += 1
-                                bytes_total += length
-                                _LOGGER.debug("PCM chunk: %d bytes", length)
-                                await loop.run_in_executor(None, playback.write, pcm_data)
-                                if not first_audio_written:
-                                    first_audio_written = True
-                                    first_audio_ts = time.monotonic()
-                            else:
-                                _LOGGER.warning("Received PCM data without START, ignoring")
-                        elif msg_type in (_MSG_END, _MSG_STOP):
-                            # Unlikely right after START, but handle gracefully
-                            pass
+                        raise
+                self._active_playback = playback
 
-                    # Start the session span (after potentially receiving METADATA)
-                    span_kwargs: dict = {"attributes": {"pcm.sample_rate": sample_rate}}
-                    if remote_context is not None:
-                        span_kwargs["context"] = remote_context
-                    session_span_ctx = _tracer.start_as_current_span(
-                        "tts_pcm.session", **span_kwargs
-                    )
-                    session_span = session_span_ctx.__enter__()
+                # Peek next byte for optional METADATA
+                next_byte = await reader.readexactly(1)
+                if next_byte[0] == _MSG_METADATA:
+                    meta_len_bytes = await reader.readexactly(4)
+                    meta_len = struct.unpack("<I", meta_len_bytes)[0]
+                    meta_json_bytes = await reader.readexactly(meta_len)
+                    try:
+                        metadata = json.loads(meta_json_bytes)
+                        _LOGGER.debug("Received METADATA: %s", metadata)
+                        remote_context = self._extract_remote_context(metadata)
+                    except (json.JSONDecodeError, Exception):
+                        _LOGGER.warning("Failed to parse METADATA JSON, ignoring")
+                    # Read the actual first message after metadata
+                    next_byte = await reader.readexactly(1)
 
-                    # If we already processed an END/STOP in the peek-ahead, break
-                    if next_byte[0] == _MSG_END:
+                # Start OTel session span
+                span_kwargs: dict = {"attributes": {"pcm.sample_rate": sample_rate}}
+                if remote_context is not None:
+                    span_kwargs["context"] = remote_context
+                session_span_ctx = _tracer.start_as_current_span("tts_pcm.session", **span_kwargs)
+                session_span = session_span_ctx.__enter__()
+
+                # Inner loop: process PCM data until END/STOP
+                # Start with the peeked byte
+                inner_msg_type = next_byte[0]
+                while True:
+                    if inner_msg_type == _MSG_PCM_DATA:
+                        len_bytes = await reader.readexactly(4)
+                        length = struct.unpack("<I", len_bytes)[0]
+                        pcm_data = await reader.readexactly(length)
+                        if playback is not None:
+                            chunks_received += 1
+                            bytes_total += length
+                            _LOGGER.debug("PCM chunk: %d bytes", length)
+                            await loop.run_in_executor(None, playback.write, pcm_data)
+                            if not first_audio_written:
+                                first_audio_written = True
+                                latency_ms = (time.monotonic() - session_start_ts) * 1000
+                                if session_span is not None:
+                                    session_span.set_attribute("pcm.first_audio_latency_ms", latency_ms)
+                                    session_span.add_event("first_audio_written", attributes={
+                                        "pcm.latency_ms": latency_ms,
+                                    })
+                                _LOGGER.debug("First audio written, latency=%.1fms", latency_ms)
+                        else:
+                            _LOGGER.warning("Received PCM data without active playback")
+
+                    elif inner_msg_type == _MSG_END:
                         _LOGGER.info("Playback END (draining)")
                         if playback is not None:
                             await loop.run_in_executor(None, playback.drain)
                             await loop.run_in_executor(None, playback.free)
                             playback = None
                             self._active_playback = None
-                        break
-                    elif next_byte[0] == _MSG_STOP:
+                        _end_session(playback, session_span, session_span_ctx,
+                                     session_start_ts, chunks_received, bytes_total, drain=True)
+                        break  # Back to outer loop, wait for next START
+
+                    elif inner_msg_type == _MSG_STOP:
                         _LOGGER.info("Playback STOP (barge-in, no drain)")
                         if playback is not None:
                             await loop.run_in_executor(None, playback.free)
                             playback = None
                             self._active_playback = None
-                        break
+                        _end_session(playback, session_span, session_span_ctx,
+                                     session_start_ts, chunks_received, bytes_total, drain=False)
+                        break  # Back to outer loop, wait for next START
 
-                    continue
-
-                elif msg_type == _MSG_PCM_DATA:
-                    # Read length (4 bytes, u32 LE) then PCM data
-                    len_bytes = await reader.readexactly(4)
-                    length = struct.unpack("<I", len_bytes)[0]
-                    pcm_data = await reader.readexactly(length)
-
-                    if playback is not None:
-                        chunks_received += 1
-                        bytes_total += length
-                        _LOGGER.debug("PCM chunk: %d bytes", length)
-                        await loop.run_in_executor(None, playback.write, pcm_data)
-                        if not first_audio_written:
-                            first_audio_written = True
-                            first_audio_ts = time.monotonic()
-                            if session_span is not None:
-                                latency_ms = (first_audio_ts - session_start_ts) * 1000
-                                session_span.set_attribute("pcm.first_audio_latency_ms", latency_ms)
-                                session_span.add_event("first_audio_written", attributes={
-                                    "pcm.latency_ms": latency_ms,
-                                })
-                                _LOGGER.debug("First audio written, latency=%.1fms", latency_ms)
                     else:
-                        _LOGGER.warning("Received PCM data without START, ignoring")
+                        _LOGGER.warning("Unexpected message type 0x%02x during session", inner_msg_type)
 
-                elif msg_type == _MSG_END:
-                    _LOGGER.info("Playback END (draining)")
-                    if playback is not None:
-                        await loop.run_in_executor(None, playback.drain)
-                        await loop.run_in_executor(None, playback.free)
-                        playback = None
-                        self._active_playback = None
-                    break
-
-                elif msg_type == _MSG_STOP:
-                    _LOGGER.info("Playback STOP (barge-in, no drain)")
-                    if playback is not None:
-                        await loop.run_in_executor(None, playback.free)
-                        playback = None
-                        self._active_playback = None
-                    break
-
-                else:
-                    _LOGGER.warning("Unknown message type: 0x%02x, closing", msg_type)
-                    break
+                    # Read next message for inner loop
+                    next_msg = await reader.readexactly(1)
+                    inner_msg_type = next_msg[0]
 
         except asyncio.IncompleteReadError:
-            _LOGGER.warning("TTS PCM client disconnected unexpectedly: %s", peer)
+            _LOGGER.warning("TTS PCM client disconnected: %s", peer)
         except asyncio.CancelledError:
             _LOGGER.info("Playback session cancelled (new connection or shutdown)")
         except Exception:
             _LOGGER.exception("Error handling TTS PCM client: %s", peer)
         finally:
-            # Record final metrics on the session span
-            duration_ms = (time.monotonic() - session_start_ts) * 1000 if session_start_ts else 0
-            if session_span is not None:
-                session_span.set_attribute("pcm.chunks_received", chunks_received)
-                session_span.set_attribute("pcm.bytes_total", bytes_total)
-                session_span.set_attribute("pcm.duration_ms", duration_ms)
-
-            # End the session span
-            if session_span_ctx is not None:
+            # Clean up any active PulseAudio stream on disconnect
+            if self._active_playback is not None:
                 try:
-                    session_span_ctx.__exit__(None, None, None)
-                except Exception:
-                    _LOGGER.debug("Error ending OTel session span", exc_info=True)
-
-            # Clean up PulseAudio stream
-            if playback is not None:
-                try:
-                    await loop.run_in_executor(None, playback.free)
+                    await loop.run_in_executor(None, self._active_playback.free)
                 except Exception:
                     _LOGGER.exception("Error freeing PulseAudio stream on cleanup")
                 self._active_playback = None
 
-            # Close TCP connection
+            # Close TCP connection only when client actually disconnects
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
-            _LOGGER.info("TTS PCM client disconnected: %s", peer)
+            _LOGGER.info("TTS PCM connection closed: %s", peer)
