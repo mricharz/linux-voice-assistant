@@ -664,11 +664,25 @@ async def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
+    parser.add_argument(
+        "--otel-endpoint",
+        default="http://172.16.5.51:4318",
+        help="OTLP HTTP endpoint for tracing (default: http://172.16.5.51:4318, empty string = disabled)",
+    )
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
+
+    # Configure OTel environment from CLI args before init
+    if args.otel_endpoint:
+        os.environ.setdefault("OTEL_ENABLED", "true")
+        os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", args.otel_endpoint)
+        os.environ.setdefault("OTEL_SERVICE_NAME", "jarvis-satellite")
+    else:
+        # Empty endpoint = explicitly disable tracing
+        os.environ["OTEL_ENABLED"] = "false"
 
     # Initialise OpenTelemetry tracing (no-op when OTEL_ENABLED != "true")
     otel_active = init_tracing()
@@ -676,6 +690,10 @@ async def main() -> None:
         global _otel_tracer
         from .otel_setup import get_tracer as _get_tracer
         _otel_tracer = _get_tracer(__name__)
+        # Re-init the TTS PCM server tracer as well
+        from .tts_pcm_server import _tracer as _pcm_tracer_ref
+        import linux_voice_assistant.tts_pcm_server as _pcm_mod
+        _pcm_mod._tracer = _get_tracer("tts_pcm_server")
 
     # Import soundcard with retry - PulseAudio may not be ready yet after boot
     sc = None
