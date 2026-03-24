@@ -22,6 +22,7 @@ from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
 from .otel_setup import get_tracer, init_tracing, shutdown_tracing
+from .tts_pcm_server import TtsPcmServer
 from .util import get_mac
 from .wyoming_client import WyomingClient, WyomingClientConfig
 from .zeroconf import HomeAssistantZeroconf
@@ -610,6 +611,19 @@ async def main() -> None:
         help="Pre-buffer duration in ms to prepend on VAD trigger (captures onset consonants). Default: 300",
     )
 
+    # TTS PCM server
+    parser.add_argument(
+        "--tts-pcm-port",
+        type=int,
+        default=9090,
+        help="TCP port for TTS PCM audio server (0 = disabled, default: 9090)",
+    )
+    parser.add_argument(
+        "--tts-pcm-sink",
+        default="smartspot_ec_sink",
+        help="PulseAudio sink for TTS playback (default: smartspot_ec_sink)",
+    )
+
     # Sounds
     parser.add_argument(
         "--wakeup-sound", default=str(_SOUNDS_DIR / "wake_word_triggered.flac")
@@ -954,6 +968,12 @@ async def main() -> None:
 
     reaper_task = asyncio.ensure_future(_reap_zombies())
 
+    # Start TTS PCM server if enabled
+    tts_pcm: Optional[TtsPcmServer] = None
+    if args.tts_pcm_port > 0:
+        tts_pcm = TtsPcmServer(port=args.tts_pcm_port, sink=args.tts_pcm_sink)
+        await tts_pcm.start()
+
     try:
         async with server:
             _LOGGER.info("Server started (host=%s, port=%s)", args.host, args.port)
@@ -962,6 +982,13 @@ async def main() -> None:
         pass
     finally:
         reaper_task.cancel()
+
+        # Stop TTS PCM server
+        if tts_pcm is not None:
+            try:
+                await tts_pcm.stop()
+            except Exception:
+                _LOGGER.exception("Failed to stop TTS PCM server during shutdown")
 
         # Stop sender thread cleanly
         try:
