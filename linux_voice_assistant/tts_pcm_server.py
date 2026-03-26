@@ -76,12 +76,12 @@ class _PulsePlayback:
             channels=1,
         )
 
-        # Low-latency buffer: 50ms target length, no prebuffering
+        # Low-latency buffer: 50ms target length, 50ms prebuffer against TCP jitter
         bytes_per_ms = sample_rate * 2 // 1000  # 2 bytes per sample (s16le mono)
         attr = _pa_buffer_attr(
             maxlength=ctypes.c_uint32(-1).value,
             tlength=bytes_per_ms * 50,
-            prebuf=0,
+            prebuf=bytes_per_ms * 50,    # 50ms prebuffer against TCP jitter
             minreq=ctypes.c_uint32(-1).value,
             fragsize=ctypes.c_uint32(-1).value,
         )
