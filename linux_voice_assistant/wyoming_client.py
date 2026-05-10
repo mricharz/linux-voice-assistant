@@ -38,6 +38,13 @@ class WyomingClientConfig:
     port: int = 10300
     satellite_id: str = ""
 
+    # Optional callback target advertised in the Wyoming `info` event so the
+    # server (Parakeet) can auto-register the satellite at the Response Handler
+    # without a second backchannel. Both must be set for the keys to be sent;
+    # otherwise they are omitted (backwards compatible with old servers).
+    callback_host: str = ""
+    callback_port: int = 0
+
     # Reconnect settings
     reconnect_min_delay: float = 1.0
     reconnect_max_delay: float = 300.0
@@ -303,10 +310,16 @@ class WyomingClient:
         # Reset backoff on successful connect
         _LOGGER.info("Wyoming: connected to %s:%d", self._config.host, self._config.port)
 
-        # Send info event with satellite identification
+        # Send info event with satellite identification.
+        # Optional callback_host/callback_port advertise the LAN target where
+        # the Response Handler should dial back PCM/TEXT frames. Only emitted
+        # when BOTH are set — keeps the wire format backwards compatible.
         info_data: Dict[str, Any] = {}
         if self._config.satellite_id:
             info_data["satellite_id"] = self._config.satellite_id
+        if self._config.callback_host and self._config.callback_port:
+            info_data["callback_host"] = self._config.callback_host
+            info_data["callback_port"] = int(self._config.callback_port)
 
         info_event = _build_event(_EVENT_INFO, data=info_data)
         self._write_raw(info_event)

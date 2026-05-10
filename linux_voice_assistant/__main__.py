@@ -605,6 +605,20 @@ async def main() -> None:
         help="Satellite ID sent to Wyoming server for identification",
     )
     parser.add_argument(
+        "--callback-host",
+        default="",
+        help="LAN host where the Response Handler should dial back PCM/TEXT "
+             "frames (must be reachable from RH). Empty = no auto-register.",
+    )
+    parser.add_argument(
+        "--callback-port",
+        type=int,
+        default=0,
+        help="LAN TCP port for callbacks (mirrors --tts-pcm-port). "
+             "0 = fall back to --tts-pcm-port if --callback-host is set; "
+             "if --callback-host is empty no auto-register info is sent.",
+    )
+    parser.add_argument(
         "--realtime-prebuffer-ms",
         type=int,
         default=300,
@@ -936,10 +950,20 @@ async def main() -> None:
     # Start Wyoming realtime client if jarvis_mode == "realtime"
     if state.jarvis_mode == "realtime":
         _LOGGER.info("Starting Wyoming realtime client (mode=realtime)")
+        # Derive callback target: explicit --callback-port wins; if missing
+        # but --callback-host is set, fall back to --tts-pcm-port (default 9090).
+        # When --callback-host is empty no auto-register hints are advertised.
+        _cb_host = args.callback_host or ""
+        if _cb_host:
+            _cb_port = args.callback_port if args.callback_port > 0 else args.tts_pcm_port
+        else:
+            _cb_port = 0
         wyoming_config = WyomingClientConfig(
             host=state.parakeet_host,
             port=state.parakeet_port,
             satellite_id=state.satellite_id,
+            callback_host=_cb_host,
+            callback_port=_cb_port,
         )
 
         def _on_transcript(text: str) -> None:
