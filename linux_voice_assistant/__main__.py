@@ -214,7 +214,7 @@ def process_audio(
                                 frame_ms=30,
                                 aggressiveness=2,
                                 min_speech_ms=150,
-                                min_silence_ms=800,
+                                min_silence_ms=700,
                                 start_delay_ms=0,
                             ))
 
