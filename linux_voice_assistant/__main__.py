@@ -212,7 +212,7 @@ def process_audio(
                             realtime_vad = LocalWebRTCVAD(LocalVADConfig(
                                 sample_rate=16000,
                                 frame_ms=30,
-                                aggressiveness=2,
+                                aggressiveness=1,
                                 min_speech_ms=150,
                                 min_silence_ms=700,
                                 start_delay_ms=0,
