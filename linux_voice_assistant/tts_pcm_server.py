@@ -9,8 +9,15 @@ Binary protocol:
     PCM_DATA = 0x02 + 4 bytes length (u32 LE) + PCM bytes
     END      = 0x03
     STOP     = 0x04  (barge-in: abort without drain)
+    TEXT     = 0x06 + 4 bytes length (u32 LE) + UTF-8 bytes  (LLM response text)
 
 Audio format: s16le mono, sample rate from START packet.
+
+Note: the satellite is an audio sink — it has no display, so the TEXT
+frame's payload is consumed and discarded. The frame must still be parsed
+(length-prefixed, same layout as PCM_DATA/METADATA) so the stream stays
+framed; otherwise the text bytes would be misread as message-type bytes
+and flood the log with one "unknown type" warning per byte.
 """
 
 import asyncio
@@ -32,6 +39,7 @@ _MSG_PCM_DATA = 0x02
 _MSG_END = 0x03
 _MSG_STOP = 0x04
 _MSG_METADATA = 0x05
+_MSG_TEXT = 0x06
 
 # PulseAudio constants
 _PA_SAMPLE_S16LE = 3
@@ -239,7 +247,12 @@ class TtsPcmServer:
             return duration_ms
 
         try:
-            # Outer loop: persistent connection, handles multiple sessions
+            # Outer loop: persistent connection, handles multiple sessions.
+            # `desynced` rate-limits the resync warning: while scanning for the
+            # next START frame we warn exactly once per desync episode, not once
+            # per discarded byte (which would be a per-byte flood by another
+            # name). The flag clears once a valid START re-syncs the stream.
+            desynced = False
             while True:
                 # Wait for START command
                 try:
@@ -252,8 +265,19 @@ class TtsPcmServer:
                 msg_type = msg_type_bytes[0]
 
                 if msg_type != _MSG_START:
-                    _LOGGER.warning("Expected START (0x01), got 0x%02x, ignoring", msg_type)
+                    # Desynced: scan silently for the next START, logging only
+                    # on the first discarded byte of this episode.
+                    if not desynced:
+                        desynced = True
+                        _LOGGER.warning(
+                            "TTS PCM: desynced (got 0x%02x, expected START 0x01), "
+                            "scanning for next START frame",
+                            msg_type,
+                        )
                     continue
+
+                # Valid START — stream re-synced, re-arm the desync warning.
+                desynced = False
 
                 # Read sample rate (4 bytes, u32 LE)
                 sr_bytes = await _read_exact(4)
@@ -349,8 +373,39 @@ class TtsPcmServer:
                                      session_start_ts, chunks_received, bytes_total, drain=False)
                         break  # Back to outer loop, wait for next START
 
+                    elif inner_msg_type == _MSG_TEXT:
+                        # TEXT frame: the LLM response text for display clients.
+                        # This satellite is an audio sink with no display, so we
+                        # consume (length-prefix + payload) and discard. Parsing
+                        # the full frame is what keeps the stream framed — skipping
+                        # it would desync and misread the text payload as message
+                        # types (one warning per byte).
+                        len_bytes = await _read_exact(4)
+                        text_len = struct.unpack("<I", len_bytes)[0]
+                        await _read_exact(text_len)  # discard — no display here
+                        _LOGGER.debug(
+                            "TEXT frame consumed: %d bytes (discarded)", text_len
+                        )
+
                     else:
-                        _LOGGER.warning("Unexpected message type 0x%02x during session", inner_msg_type)
+                        # Genuinely unknown type byte. Correct framing means this
+                        # should not happen mid-stream; if it does, the stream is
+                        # desynced and we cannot know this frame's length to skip
+                        # it. Log once and end the session rather than spinning
+                        # per-byte (which would flood the log). The connection
+                        # stays open for the next START.
+                        _LOGGER.warning(
+                            "Unknown message type 0x%02x during session, "
+                            "resyncing (ending session)",
+                            inner_msg_type,
+                        )
+                        if playback is not None:
+                            await loop.run_in_executor(None, playback.free)
+                            playback = None
+                            self._active_playback = None
+                        _end_session(playback, session_span, session_span_ctx,
+                                     session_start_ts, chunks_received, bytes_total, drain=False)
+                        break  # Back to outer loop, wait for next START
 
                     # Read next message for inner loop
                     next_msg = await _read_exact(1)
