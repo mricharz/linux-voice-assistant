@@ -37,6 +37,8 @@ dependencies = [
     "opentelemetry-api>=1.20,<2",
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+    "websockets>=12,<17",
+    "aiohttp>=3.9,<4",
 ]
 
 [project.optional-dependencies]

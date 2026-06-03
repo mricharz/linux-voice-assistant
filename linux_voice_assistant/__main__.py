@@ -23,8 +23,13 @@ from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
 from .otel_setup import get_tracer, init_tracing, shutdown_tracing
 from .tts_pcm_server import TtsPcmServer
-from .util import get_mac
-from .wyoming_client import WyomingClient, WyomingClientConfig
+from .util import emit_event, get_mac
+from .wyoming_client import WyomingClient
+from .wyoming_ws_client import (
+    WyomingWsClient,
+    WyomingWsClientConfig,
+    build_realtime_client,
+)
 from .zeroconf import HomeAssistantZeroconf
 
 _LOGGER = logging.getLogger(__name__)
@@ -625,6 +630,46 @@ async def main() -> None:
         help="Pre-buffer duration in ms to prepend on VAD trigger (captures onset consonants). Default: 300",
     )
 
+    # BFF WSS uplink (JR4-166 M1). When --bff-url is set the realtime client
+    # connects to the central BFF gateway over WSS instead of dialing Parakeet
+    # directly over TCP. Rollback-safe: empty --bff-url keeps the legacy TCP path.
+    parser.add_argument(
+        "--bff-url",
+        default=os.environ.get("BFF_URL", ""),
+        help="BFF Wyoming WSS endpoint, e.g. wss://jarvis-voice.megaira.de/v1/wyoming. "
+             "When set, the realtime client uses WSS-via-BFF instead of direct TCP to "
+             "Parakeet (env: BFF_URL). Empty = legacy direct-TCP path.",
+    )
+    parser.add_argument(
+        "--bff-auth-enabled",
+        action="store_true",
+        default=os.environ.get("BFF_AUTH_ENABLED", "true").lower()
+        not in ("0", "false", "no"),
+        help="Send an OIDC client-credentials bearer JWT to the BFF "
+             "(env: BFF_AUTH_ENABLED, default true). Disable only for a "
+             "soft-launch passthrough window against an AUTH_ENABLED=false bridge.",
+    )
+    parser.add_argument(
+        "--oidc-token-url",
+        default=os.environ.get("OIDC_TOKEN_URL", ""),
+        help="Authelia OIDC token endpoint for client-credentials (env: OIDC_TOKEN_URL).",
+    )
+    parser.add_argument(
+        "--oidc-client-id",
+        default=os.environ.get("OIDC_CLIENT_ID", ""),
+        help="OIDC client_id for the SmartSpot service account (env: OIDC_CLIENT_ID).",
+    )
+    parser.add_argument(
+        "--oidc-client-secret",
+        default=os.environ.get("OIDC_CLIENT_SECRET", ""),
+        help="OIDC client_secret plaintext (env: OIDC_CLIENT_SECRET).",
+    )
+    parser.add_argument(
+        "--oidc-audience",
+        default=os.environ.get("OIDC_AUDIENCE", "svc:voice"),
+        help="OIDC audience/scope requested for the BFF (env: OIDC_AUDIENCE, default svc:voice).",
+    )
+
     # TTS PCM server
     parser.add_argument(
         "--tts-pcm-port",
@@ -958,18 +1003,56 @@ async def main() -> None:
             _cb_port = args.callback_port if args.callback_port > 0 else args.tts_pcm_port
         else:
             _cb_port = 0
-        wyoming_config = WyomingClientConfig(
-            host=state.parakeet_host,
-            port=state.parakeet_port,
-            satellite_id=state.satellite_id,
-            callback_host=_cb_host,
-            callback_port=_cb_port,
-        )
 
         def _on_transcript(text: str) -> None:
             _LOGGER.info("Realtime transcript: %s", text)
 
-        wyoming_rt_client = WyomingClient(wyoming_config, on_transcript=_on_transcript)
+        def _on_connection_state(connected: bool) -> None:
+            if connected:
+                _LOGGER.info("Wyoming: connected — emitting ready LED")
+                emit_event(state, "ready")
+            else:
+                _LOGGER.warning("Wyoming: disconnected — emitting error LED")
+                emit_event(state, "error")
+
+        # JR4-166 M1: when --bff-url is set, route the uplink through the central
+        # BFF gateway over WSS instead of dialing Parakeet directly over TCP.
+        # The legacy TCP path stays behind the flag for one-release rollback.
+        # The resolved BFF config + callback target are stashed on ServerState so
+        # a runtime HA mode toggle (_manage_wyoming_client) rebuilds the same
+        # WSS-or-TCP client via the shared factory — selection logic lives in one
+        # place (build_realtime_client).
+        bff_config: Optional[WyomingWsClientConfig] = None
+        if args.bff_url:
+            _LOGGER.info("Realtime uplink via BFF WSS: %s", args.bff_url)
+            bff_config = WyomingWsClientConfig(
+                bff_url=args.bff_url,
+                satellite_id=state.satellite_id,
+                callback_host=_cb_host,
+                callback_port=_cb_port,
+                auth_enabled=args.bff_auth_enabled,
+                oidc_token_url=args.oidc_token_url,
+                oidc_client_id=args.oidc_client_id,
+                oidc_client_secret=args.oidc_client_secret,
+                oidc_audience=args.oidc_audience,
+            )
+
+        state.bff_config = bff_config
+        state.callback_host = _cb_host
+        state.callback_port = _cb_port
+
+        wyoming_rt_client: Union[WyomingClient, WyomingWsClient]
+        wyoming_rt_client = build_realtime_client(
+            bff_config=bff_config,
+            parakeet_host=state.parakeet_host,
+            parakeet_port=state.parakeet_port,
+            satellite_id=state.satellite_id,
+            callback_host=_cb_host,
+            callback_port=_cb_port,
+            on_transcript=_on_transcript,
+            on_connection_state=_on_connection_state,
+        )
+
         state._wyoming_client = wyoming_rt_client  # type: ignore[attr-defined]
         await wyoming_rt_client.start()
 

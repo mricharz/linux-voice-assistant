@@ -325,7 +325,7 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _manage_wyoming_client(self, mode: str) -> None:
         """Start or stop the Wyoming realtime client based on mode."""
-        from .wyoming_client import WyomingClient, WyomingClientConfig
+        from .wyoming_ws_client import build_realtime_client
 
         loop = self._loop
         if loop is None:
@@ -339,12 +339,6 @@ class VoiceSatelliteProtocol(APIServer):
                 _LOGGER.debug("Wyoming client already running")
                 return
 
-            config = WyomingClientConfig(
-                host=self.state.parakeet_host,
-                port=self.state.parakeet_port,
-                satellite_id=self.state.satellite_id,
-            )
-
             def _on_transcript(text: str) -> None:
                 _LOGGER.info("Realtime transcript: %s", text)
 
@@ -356,8 +350,18 @@ class VoiceSatelliteProtocol(APIServer):
                     _LOGGER.warning("Wyoming: disconnected — emitting error LED")
                     emit_event(self.state, "error")
 
-            client = WyomingClient(
-                config,
+            # JR4-166 M1: honor --bff-url on a runtime mode toggle too. The
+            # shared factory picks WSS-via-BFF when bff_config was stashed at
+            # boot, else the legacy direct-TCP client — same selection logic as
+            # __main__.py. The 4011 STT-down LED feedback rides on whichever
+            # client is built via the on_connection_state callback.
+            client = build_realtime_client(
+                bff_config=getattr(self.state, "bff_config", None),
+                parakeet_host=self.state.parakeet_host,
+                parakeet_port=self.state.parakeet_port,
+                satellite_id=self.state.satellite_id,
+                callback_host=getattr(self.state, "callback_host", ""),
+                callback_port=getattr(self.state, "callback_port", 0),
                 on_transcript=_on_transcript,
                 on_connection_state=_on_connection_state,
             )
