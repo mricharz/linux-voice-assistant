@@ -34,6 +34,10 @@ dependencies = [
     "python-mpv>=1,<2",
     "zeroconf<1",
     "webrtcvad>=2.0.10,<3",
+    # webrtcvad imports pkg_resources at load time; setuptools>=81 removed it. script/setup
+    # runs `pip install --upgrade setuptools`, which would pull 81+ into the runtime venv and
+    # break webrtcvad on next start. Pin the runtime setuptools so `pip install -e .` keeps <81.
+    "setuptools<81",
     "opentelemetry-api>=1.20,<2",
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
