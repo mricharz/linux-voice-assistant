@@ -1,10 +1,12 @@
 """Tests for the Wyoming WSS-via-BFF client (JR4-166).
 
-Covers: config defaults / backoff curve, read-timeout reconnect,
-backoff-reset-after-stable, close-code -> token-refresh path, OIDC token
-caching, the bounded send queue + drain task, and frame encode parity (the
-channel-prefixed remainder is byte-identical to ``_build_event``). No live token
-or network is required — all I/O is faked.
+Covers: config defaults / backoff curve, the idle-recv liveness contract
+(no app-level read timeout — protocol ping/pong owns liveness, ConnectionClosed
+from recv() triggers reconnect), backoff-reset-after-stable, close-code ->
+token-refresh path, OIDC token caching, the bounded send queue + drain task, the
+0x02 heartbeat task, and frame encode parity (the channel-prefixed remainder is
+byte-identical to ``_build_event``). No live token or network is required — all
+I/O is faked.
 """
 
 import asyncio
@@ -23,6 +25,8 @@ from linux_voice_assistant.wyoming_protocol import (
     _build_event,
 )
 from linux_voice_assistant.wyoming_ws_client import (
+    _CHANNEL_HEARTBEAT,
+    _CHANNEL_HEARTBEAT_FRAME,
     _CHANNEL_WYOMING,
     _WS_CLOSE_AUDIENCE,
     _WS_CLOSE_AUTH,
@@ -44,12 +48,11 @@ def config():
         reconnect_max_delay=0.5,
         reconnect_multiplier=2.0,
         reconnect_jitter=0.0,  # no jitter for deterministic tests
-        read_timeout=1.0,
     )
 
 
 # ---------------------------------------------------------------------------
-# Config / resilience knobs (backoff curve, read timeout per CLAUDE.md)
+# Config / resilience knobs (backoff curve, ping/pong liveness per CLAUDE.md)
 # ---------------------------------------------------------------------------
 
 
@@ -59,13 +62,19 @@ def test_config_defaults():
     assert cfg.reconnect_max_delay == 300.0
     assert cfg.reconnect_min_delay == 1.0
     assert cfg.reconnect_multiplier == 2.0
-    assert cfg.read_timeout == 60.0
 
 
-def test_config_read_timeout_default():
-    """Read timeout should default to 60s."""
+def test_config_has_no_read_timeout():
+    """The app-level read_timeout knob is gone (liveness = ping/pong, M2.x)."""
     cfg = WyomingWsClientConfig()
-    assert cfg.read_timeout == 60.0
+    assert not hasattr(cfg, "read_timeout")
+
+
+def test_config_pingpong_defaults():
+    """Ping/pong owns liveness: 30s ping interval, 60s pong timeout."""
+    cfg = WyomingWsClientConfig()
+    assert cfg.ping_interval == 30.0
+    assert cfg.ping_timeout == 60.0
 
 
 def test_backoff_curve_matches_tcp_client():
@@ -504,6 +513,142 @@ def test_drain_task_cancelled_and_queue_cleared_on_disconnect(config):
 
 
 # ---------------------------------------------------------------------------
+# 0x02 HEARTBEAT control frame (dedicated task, NOT the audio send queue)
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_frame_is_bare_0x02():
+    """The reused heartbeat frame is exactly the 1-byte channel marker [0x02]."""
+    assert _CHANNEL_HEARTBEAT == 0x02
+    assert _CHANNEL_HEARTBEAT_FRAME == bytes([0x02])
+    assert len(_CHANNEL_HEARTBEAT_FRAME) == 1
+
+
+def test_heartbeat_loop_sends_on_cadence_directly(config, monkeypatch):
+    """The heartbeat task sends [0x02] directly on ws every interval — not queued.
+
+    Patches the interval to a tiny value and the sleep to advance instantly, then
+    asserts the frame went out via ``ws.send`` and the audio send queue was never
+    touched (liveness must not share fate with droppable audio).
+    """
+
+    async def _run():
+        client = WyomingWsClient(config)
+
+        sent = []
+        mock_ws = MagicMock()
+
+        async def _send(data):
+            sent.append(data)
+
+        mock_ws.send = _send
+
+        # Make the loop beat fast and deterministically: zero-out the sleep so a
+        # few iterations run immediately, then cancel.
+        monkeypatch.setattr(ws_mod, "_HEARTBEAT_INTERVAL_S", 0.0)
+        task = asyncio.ensure_future(client._heartbeat_loop(mock_ws))
+        # Let several beats fire.
+        for _ in range(20):
+            if len(sent) >= 3:
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return sent, client._send_queue.qsize()
+
+    sent, queue_size = asyncio.run(_run())
+    assert len(sent) >= 3
+    # Sleep-before-send: every beat is the bare 1-byte 0x02 frame, sent directly.
+    assert all(frame == _CHANNEL_HEARTBEAT_FRAME for frame in sent)
+    # The heartbeat NEVER goes through the drop-oldest audio queue.
+    assert queue_size == 0
+
+
+def test_heartbeat_send_failure_marks_disconnected(config, monkeypatch):
+    """A heartbeat ws.send error clears _connected and returns (→ reconnect)."""
+
+    async def _run():
+        client = WyomingWsClient(config)
+        client._connected = True
+
+        mock_ws = MagicMock()
+
+        async def _boom(_data):
+            raise RuntimeError("socket gone")
+
+        mock_ws.send = _boom
+
+        # Zero the cadence so the loop reaches the (failing) send without a real
+        # 30s wait, then returns on the swallowed error.
+        monkeypatch.setattr(ws_mod, "_HEARTBEAT_INTERVAL_S", 0.0)
+        await client._heartbeat_loop(mock_ws)  # returns after the failed send
+        return client._connected
+
+    connected = asyncio.run(_run())
+    assert connected is False  # send failure tore the connection down
+
+
+def test_heartbeat_task_started_on_connect(monkeypatch):
+    """_connect_and_listen starts exactly one heartbeat task tied to the ws."""
+    cfg = WyomingWsClientConfig(
+        bff_url="wss://localhost/v1/wyoming",
+        satellite_id="sat-1",
+        auth_enabled=False,
+    )
+
+    async def _run():
+        client = WyomingWsClient(cfg)
+        client._running = True
+
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock()
+
+        async def _recv():
+            raise websockets.ConnectionClosed(None, None)
+
+        mock_ws.recv = _recv
+
+        async def _fake_connect(*args, **kwargs):
+            return mock_ws
+
+        monkeypatch.setattr(ws_mod.websockets, "connect", _fake_connect)
+
+        await client._connect_and_listen()
+        captured = {
+            "task": client._heartbeat_task,
+            "done": client._heartbeat_task.done() if client._heartbeat_task else None,
+        }
+        await client._close_connection()
+        return captured
+
+    captured = asyncio.run(_run())
+    assert captured["task"] is not None  # connect started a heartbeat task
+    assert captured["done"] is False  # alive (parked on the +30s sleep)
+
+
+def test_heartbeat_task_cancelled_on_disconnect(config):
+    """_close_connection cancels + nulls the heartbeat task (no leak/stale beat)."""
+
+    async def _run():
+        client = WyomingWsClient(config)
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock()
+        mock_ws.close = AsyncMock()
+        client._ws = mock_ws
+        client._connected = True
+        client._heartbeat_task = asyncio.ensure_future(client._heartbeat_loop(mock_ws))
+
+        await client._close_connection()
+        return client
+
+    client = asyncio.run(_run())
+    assert client._heartbeat_task is None  # task reference cleared, not leaked
+
+
+# ---------------------------------------------------------------------------
 # _parse_event — inbound transcript framing
 # ---------------------------------------------------------------------------
 
@@ -563,23 +708,63 @@ def test_transcript_callback_via_listen(config):
 
 
 # ---------------------------------------------------------------------------
-# Read-timeout -> reconnect
+# Liveness contract: no app-level read timeout — idle recv() just waits;
+# ConnectionClosed (from ping/pong timeout or a dropped socket) reconnects.
 # ---------------------------------------------------------------------------
 
 
-def test_read_timeout_breaks_listen_loop(config):
-    """A recv() that never returns within read_timeout drops the connection."""
+def test_idle_recv_does_not_reconnect(config):
+    """A quiet-but-alive socket does NOT churn: recv() simply waits, no reconnect.
+
+    The app-level read_timeout reconnect is gone — a recv() that stays pending
+    must keep the connection up (idle is not a fault). The loop is parked on the
+    pending recv(); it is cancelled out of band, exactly as a real disconnect
+    would, and _connected must NOT have been cleared by any idle path.
+    """
+
+    async def _run():
+        client = WyomingWsClient(config)
+        client._connected = True
+        client._running = True
+
+        class _QuietWs:
+            async def recv(self):
+                # Never returns and never raises — a quiet, healthy socket.
+                await asyncio.sleep(3600)
+
+        client._ws = _QuietWs()
+        listen = asyncio.ensure_future(client._listen_loop())
+        # Give the loop real wall-clock time to (not) decide to reconnect; the
+        # old read_timeout was 1.0s in the test config — well under this.
+        await asyncio.sleep(1.5)
+        still_connected = client._connected and not listen.done()
+        listen.cancel()
+        try:
+            await listen
+        except asyncio.CancelledError:
+            pass
+        return still_connected
+
+    assert asyncio.run(_run()) is True
+
+
+def test_connection_closed_from_recv_triggers_reconnect(config):
+    """ConnectionClosed from recv() clears _connected so the reconnect loop fires.
+
+    This is what the ping/pong timeout (no PONG within ping_timeout) surfaces as
+    — the websockets lib closes the socket and recv() raises ConnectionClosed.
+    """
     client = WyomingWsClient(config)
     client._connected = True
     client._running = True
 
-    class _StalledWs:
+    class _DeadWs:
         async def recv(self):
-            await asyncio.sleep(10)  # longer than read_timeout (1.0s)
+            raise websockets.ConnectionClosed(None, None)
 
-    client._ws = _StalledWs()
+    client._ws = _DeadWs()
     asyncio.run(client._listen_loop())
-    # Loop must have set _connected False on timeout (triggers reconnect).
+    # ConnectionClosed broke the loop and cleared _connected → reconnect.
     assert not client._connected
 
 
