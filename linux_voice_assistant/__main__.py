@@ -18,6 +18,7 @@ from aioesphomeapi.model import VoiceAssistantEventType
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .downlink_config import resolve_downlink_mode
 from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
@@ -669,6 +670,20 @@ async def main() -> None:
         default=os.environ.get("OIDC_AUDIENCE", "svc:voice"),
         help="OIDC audience/scope requested for the BFF (env: OIDC_AUDIENCE, default svc:voice).",
     )
+    # Downlink transport (JR4-166 M2). "lan" (default, rollback-safe): TTS comes
+    # back over the legacy Direct-TCP TtsPcmServer on :9090 and the RH dials
+    # back. "wss" (needs --bff-url): TTS comes DOWN the same multiplexed
+    # /v1/satellite/link/{id} socket as 0x01-channel frames, uplink frames carry
+    # the 0x00 channel prefix, the :9090 server is NOT started, and no LAN
+    # callback is advertised (the BFF auto-registers delivery_mode=wss).
+    parser.add_argument(
+        "--downlink",
+        choices=("lan", "wss"),
+        default=os.environ.get("DOWNLINK", "lan"),
+        help="TTS downlink transport: 'lan' (default, Direct-TCP :9090 + RH "
+             "dial-back) or 'wss' (multiplexed over the BFF /satellite/link/ "
+             "socket; requires --bff-url). Env: DOWNLINK.",
+    )
 
     # TTS PCM server
     parser.add_argument(
@@ -992,17 +1007,37 @@ async def main() -> None:
     except Exception:
         _LOGGER.exception("Failed to save preferences at startup")
 
+    # JR4-166 M2: WSS downlink only applies on the multiplexed BFF link, which
+    # requires --bff-url. The pure helper guards against a misconfiguration that
+    # would silently leave TTS with no path back.
+    downlink_mode = resolve_downlink_mode(args.downlink, args.bff_url)
+    wss_downlink = downlink_mode == "wss"
+
     # Start Wyoming realtime client if jarvis_mode == "realtime"
     if state.jarvis_mode == "realtime":
-        _LOGGER.info("Starting Wyoming realtime client (mode=realtime)")
+        _LOGGER.info(
+            "Starting Wyoming realtime client (mode=realtime, downlink=%s)",
+            downlink_mode,
+        )
         # Derive callback target: explicit --callback-port wins; if missing
         # but --callback-host is set, fall back to --tts-pcm-port (default 9090).
         # When --callback-host is empty no auto-register hints are advertised.
-        _cb_host = args.callback_host or ""
-        if _cb_host:
-            _cb_port = args.callback_port if args.callback_port > 0 else args.tts_pcm_port
-        else:
+        #
+        # WSS downlink (M2): the BFF auto-registers delivery_mode=wss on the
+        # satellite's behalf (D-1), so SmartSpot must NOT advertise a LAN
+        # callback target — doing so would register a Direct-TCP dial-back the
+        # RH would prefer over the WSS sink. Force the callback off.
+        if wss_downlink:
+            _cb_host = ""
             _cb_port = 0
+        else:
+            _cb_host = args.callback_host or ""
+            if _cb_host:
+                _cb_port = (
+                    args.callback_port if args.callback_port > 0 else args.tts_pcm_port
+                )
+            else:
+                _cb_port = 0
 
         def _on_transcript(text: str) -> None:
             _LOGGER.info("Realtime transcript: %s", text)
@@ -1035,6 +1070,8 @@ async def main() -> None:
                 oidc_client_id=args.oidc_client_id,
                 oidc_client_secret=args.oidc_client_secret,
                 oidc_audience=args.oidc_audience,
+                downlink_mode=downlink_mode,
+                tts_sink=args.tts_pcm_sink,
             )
 
         state.bff_config = bff_config
@@ -1093,11 +1130,25 @@ async def main() -> None:
 
     reaper_task = asyncio.ensure_future(_reap_zombies())
 
-    # Start TTS PCM server if enabled
+    # Start TTS PCM server if enabled. JR4-166 M2: when the downlink runs over
+    # the multiplexed BFF link (--downlink wss) TTS arrives ON that socket and
+    # is played by the link client's TtsPlaybackSink — the :9090 Direct-TCP
+    # server is not needed and is left unstarted (the RH never dials back).
+    # The skip is gated on the realtime client actually running: --downlink wss
+    # only carries TTS when the link client is up, so in wakeword boot the :9090
+    # server stays available (avoids a no-TTS-path footgun if wss is set without
+    # an active link).
+    skip_tts_pcm = wss_downlink and state.jarvis_mode == "realtime"
     tts_pcm: Optional[TtsPcmServer] = None
-    if args.tts_pcm_port > 0:
+    if args.tts_pcm_port > 0 and not skip_tts_pcm:
         tts_pcm = TtsPcmServer(port=args.tts_pcm_port, sink=args.tts_pcm_sink)
         await tts_pcm.start()
+    elif skip_tts_pcm:
+        _LOGGER.info(
+            "TTS PCM server (:%d) not started — downlink is multiplexed over the "
+            "BFF link (--downlink wss)",
+            args.tts_pcm_port,
+        )
 
     try:
         async with server:

@@ -36,6 +36,7 @@ import aiohttp
 import websockets
 
 from .otel_setup import get_tracer, get_current_trace_context
+from .tts_playback_sink import TtsPlaybackSink
 from .wyoming_client import (
     _EVENT_AUDIO_CHUNK,
     _EVENT_AUDIO_START,
@@ -49,6 +50,22 @@ from .wyoming_client import (
 
 _LOGGER = logging.getLogger(__name__)
 _otel_tracer = get_tracer("wyoming_ws_client")
+
+# Frame-channel header bytes for the multiplexed /v1/satellite/link/{id} socket
+# (JR4-166 M2, §3.1). The 1-byte channel marker sits at offset 0 of every frame;
+# the channel-specific payload follows at offset 1.
+#   0x00 WYOMING       uplink: mic audio + Wyoming control events (satellite→BFF)
+#   0x01 DOWNLINK_TTS  downlink: one PcmClient TTS frame (BFF→satellite)
+#   0x02..0x0F         reserved for M3 control (dropped here, never closes)
+# On the legacy /v1/wyoming uplink-only endpoint NO channel byte is prepended —
+# the prefix is gated on ``downlink_mode == "wss"`` (a /link/ connection).
+_CHANNEL_WYOMING = 0x00
+_CHANNEL_DOWNLINK_TTS = 0x01
+# Single reusable 1-byte prefix buffer for the uplink channel marker. Prepending
+# it is a one-byte ``bytes`` concat per frame — cheap on the Pi, and the only
+# alloc the multiplex adds to the uplink hot path (the alternative, a per-frame
+# bytearray with an inserted byte, is no cheaper and loses _build_event reuse).
+_CHANNEL_WYOMING_PREFIX = bytes([_CHANNEL_WYOMING])
 
 # Structured close codes emitted by the BFF Wyoming bridge.
 _WS_CLOSE_AUTH = 4001  # token invalid/expired -> refresh + reconnect
@@ -79,9 +96,21 @@ _DROP_WARN_INTERVAL_S = 60.0
 class WyomingWsClientConfig:
     """Configuration for the Wyoming WSS-via-BFF client."""
 
-    # BFF WSS endpoint, e.g. wss://jarvis-voice.megaira.de/v1/wyoming
+    # BFF WSS endpoint. On the M1 uplink-only path this is
+    # wss://.../v1/wyoming; on the M2 multiplexed link it is
+    # wss://.../v1/satellite/link/{satellite_id} (the id is in the PATH).
     bff_url: str = ""
     satellite_id: str = ""
+
+    # Downlink transport (JR4-166 M2). "lan": TTS comes back over the legacy
+    # Direct-TCP TtsPcmServer on :9090 (this client is uplink-only, no channel
+    # byte). "wss": TTS comes DOWN this same multiplexed socket as 0x01-channel
+    # frames, and EVERY outbound frame is prefixed with the 0x00 channel byte.
+    # Default "lan" keeps M1 behaviour for one-release rollback.
+    downlink_mode: str = "lan"
+    # PulseAudio sink for downlink TTS playback (only used when downlink_mode is
+    # "wss"; mirrors --tts-pcm-sink).
+    tts_sink: str = ""
 
     # Optional callback target advertised in the Wyoming `info` event so the
     # server (Parakeet) can auto-register the satellite at the Response Handler.
@@ -188,6 +217,18 @@ class WyomingWsClient:
         self._config = config
         self._on_transcript = on_transcript
         self._on_connection_state = on_connection_state
+
+        # Multiplexed-link mode (M2): when downlink_mode == "wss" the uplink
+        # frames carry the 0x00 channel prefix and inbound 0x01 frames are
+        # demuxed to the downlink TTS sink. Cached once (config is immutable per
+        # client) so the per-frame hot path is a bare bool read.
+        self._multiplex = config.downlink_mode == "wss"
+        # Downlink TTS playback sink — created only in multiplex mode. Reused
+        # across reconnects (it carries no socket state, only PulseAudio
+        # session state which is torn down per END/STOP/close).
+        self._tts_sink: Optional[TtsPlaybackSink] = None
+        if self._multiplex:
+            self._tts_sink = TtsPlaybackSink(sink=config.tts_sink or None)
 
         self._ws: Optional[Any] = None
         self._listen_task: Optional[asyncio.Task] = None
@@ -328,9 +369,19 @@ class WyomingWsClient:
 
         The bridge forwards binary frames to the TCP socket verbatim, so the
         event bytes arrive at Parakeet byte-identical.
+
+        Multiplex (M2): when ``downlink_mode == "wss"`` every outbound frame is
+        prefixed with the 0x00 WYOMING channel byte at offset 0; the BFF strips
+        it and relays ``frame[1:]`` to parakeet verbatim. On the legacy uplink-
+        only ``/v1/wyoming`` path (``downlink_mode == "lan"``) no prefix is
+        added, so the bytes stay byte-identical to M1.
         """
         if self._ws is None:
             return
+        if self._multiplex:
+            # One-byte channel prefix. Single concat per frame (cheapest correct
+            # form that keeps _build_event reuse intact); negligible on the Pi.
+            data = _CHANNEL_WYOMING_PREFIX + data
         try:
             self._send_queue.put_nowait(data)
         except asyncio.QueueFull:
@@ -413,9 +464,63 @@ class WyomingWsClient:
                 self._config.reconnect_max_delay,
             )
 
+    def _resolve_connect_url(self) -> str:
+        """Resolve the actual WSS URL to dial.
+
+        Legacy (downlink_mode == "lan"): connect to ``bff_url`` verbatim
+        (``wss://.../v1/wyoming``) — uplink-only, M1 behaviour unchanged.
+
+        Multiplex (downlink_mode == "wss"): the satellite_id MUST live in the
+        PATH (``/v1/satellite/link/{satellite_id}``) — that is how the BFF keys
+        the downlink subscriber (it never parses the info event for the id). To
+        keep ONE source of truth for the id and remove any path↔info-event↔
+        routing mismatch, the path is DERIVED here from ``satellite_id`` and the
+        scheme+host of ``bff_url`` — the operator's ``--bff-url`` path component
+        (e.g. ``/v1/wyoming``) is ignored in this mode. The same ``satellite_id``
+        is still also sent inside the info event for parakeet's downstream
+        auto-register (§3.4), so the two CANNOT diverge.
+        """
+        if not self._multiplex:
+            return self._config.bff_url
+
+        base = self._config.bff_url
+        sat_id = self._config.satellite_id
+        if not sat_id:
+            # Multiplex needs the id in the PATH to key the downlink subscriber.
+            # An empty id would build ``.../v1/satellite/link/`` (empty segment),
+            # which the BFF rejects (4007) — surfacing as a confusing auth-close
+            # reconnect loop. Log + raise a clear local error instead so the
+            # misconfiguration is obvious immediately (the connection loop's
+            # generic handler does not echo the exception message, so the cause
+            # is logged here on every attempt).
+            _LOGGER.error(
+                "downlink_mode='wss' requires a non-empty satellite_id (it is the "
+                "/v1/satellite/link/{id} path segment); refusing to dial an "
+                "empty-segment link URL — check the satellite_id configuration"
+            )
+            raise RuntimeError("multiplex downlink requires a non-empty satellite_id")
+        # Split scheme://host[:port] from any trailing path so we can swap in the
+        # canonical /link/{id} path regardless of what path the operator passed.
+        scheme_sep = base.find("://")
+        if scheme_sep < 0:
+            # No scheme — treat the whole thing as authority (defensive).
+            authority = base.rstrip("/")
+            prefix = ""
+        else:
+            prefix = base[: scheme_sep + 3]
+            rest = base[scheme_sep + 3 :]
+            slash = rest.find("/")
+            authority = (rest if slash < 0 else rest[:slash]).rstrip("/")
+        # Note: the satellite_id may contain colons (the namespaced
+        # ``client:jarvis-svc-smartspot:smartspot`` form, D-4) — colons are valid
+        # in a URL path segment and the BFF nginx ``[^/]+`` regex accepts them,
+        # so the id is placed in the path as-is (no percent-encoding).
+        return "{}{}/v1/satellite/link/{}".format(prefix, authority, sat_id)
+
     async def _connect_and_listen(self) -> None:
         """Open the WSS connection, send info event, then listen for responses."""
-        _LOGGER.info("Connecting to BFF Wyoming bridge at %s", self._config.bff_url)
+        connect_url = self._resolve_connect_url()
+        _LOGGER.info("Connecting to BFF bridge at %s", connect_url)
 
         subprotocols = None
         if self._config.auth_enabled:
@@ -432,7 +537,7 @@ class WyomingWsClient:
 
         try:
             self._ws = await websockets.connect(
-                self._config.bff_url,
+                connect_url,
                 subprotocols=subprotocols,
                 ping_interval=self._config.ping_interval,
                 ping_timeout=self._config.ping_timeout,
@@ -450,7 +555,7 @@ class WyomingWsClient:
 
         self._connected = True
         self._notify_connection_state(True)
-        _LOGGER.info("Wyoming WS: connected to %s", self._config.bff_url)
+        _LOGGER.info("Wyoming WS: connected to %s", connect_url)
 
         # Start the single persistent drain task for this connection. The
         # connection loop always runs _close_connection (which cancels the drain
@@ -468,6 +573,14 @@ class WyomingWsClient:
             info_data["callback_port"] = int(self._config.callback_port)
 
         info_event = _build_event(_EVENT_INFO, data=info_data)
+        # The info frame is sent directly (not via the drain queue) so it is the
+        # first frame on the wire before any audio. On the multiplexed /link/
+        # socket it must carry the 0x00 WYOMING channel prefix exactly like every
+        # other uplink frame, or the BFF would read the JSON '{' as a channel
+        # byte. (The drain-queue uplink path prefixes in _write_raw; this direct
+        # send mirrors that.)
+        if self._multiplex:
+            info_event = _CHANNEL_WYOMING_PREFIX + info_event
         await self._ws.send(info_event)
 
         # Listen for incoming events
@@ -502,6 +615,38 @@ class WyomingWsClient:
                 self._connected = False
                 break
 
+            # Multiplex demux (M2): on the /link/ socket inbound binary frames
+            # are tagged with a 1-byte channel header at offset 0.
+            #   0x01 DOWNLINK_TTS → one bare PcmClient frame at offset 1; hand it
+            #                       to the TTS playback sink (audio hot path).
+            #   0x00 WYOMING      → a Wyoming control/transcript event at offset 1
+            #                       (strip the channel byte, parse as before).
+            # Text frames are never channel-tagged (the BFF only multiplexes
+            # binary), so they fall through to the transcript path unchanged.
+            if self._multiplex and isinstance(message, (bytes, bytearray)):
+                if not message:
+                    continue
+                channel = message[0]
+                if channel == _CHANNEL_DOWNLINK_TTS:
+                    if self._tts_sink is not None:
+                        # Strip the channel byte; the rest is one PcmClient frame.
+                        await self._tts_sink.handle_frame(bytes(message[1:]))
+                    continue
+                if channel == _CHANNEL_WYOMING:
+                    raw = bytes(message[1:])
+                    event = _parse_event(raw)
+                    if event is not None:
+                        self._dispatch_wyoming_event(event)
+                    continue
+                # Reserved channel (0x02..) — drop, never close (forward-compat,
+                # mirrors the BFF's unknown-channel policy).
+                _LOGGER.debug(
+                    "Wyoming WS: dropping reserved-channel downlink frame (0x%02x)",
+                    channel,
+                )
+                continue
+
+            # Non-multiplex (legacy /v1/wyoming) path + any text frame.
             # Control + transcript frames are text; audio (none inbound) binary.
             if isinstance(message, str):
                 raw = message.encode("utf-8")
@@ -512,23 +657,31 @@ class WyomingWsClient:
             if event is None:
                 continue
 
-            event_type = event.get("type", "")
-            event_data = event.get("data")
+            self._dispatch_wyoming_event(event)
 
-            if event_type == _EVENT_TRANSCRIPT:
-                text = ""
-                if isinstance(event_data, dict):
-                    text = event_data.get("text", "")
-                if text and self._on_transcript:
-                    _LOGGER.info("Wyoming WS transcript: %s", text)
-                    try:
-                        self._on_transcript(text)
-                    except Exception:
-                        _LOGGER.exception("Error in transcript callback")
-                elif text:
-                    _LOGGER.info("Wyoming WS transcript (no handler): %s", text)
-            else:
-                _LOGGER.debug("Wyoming WS event: type=%s", event_type)
+    def _dispatch_wyoming_event(self, event: Dict[str, Any]) -> None:
+        """Route a parsed Wyoming event (today: only transcript is consumed).
+
+        Shared by the legacy uplink-only path and the multiplexed 0x00-channel
+        path so both consume inbound transcripts identically.
+        """
+        event_type = event.get("type", "")
+        event_data = event.get("data")
+
+        if event_type == _EVENT_TRANSCRIPT:
+            text = ""
+            if isinstance(event_data, dict):
+                text = event_data.get("text", "")
+            if text and self._on_transcript:
+                _LOGGER.info("Wyoming WS transcript: %s", text)
+                try:
+                    self._on_transcript(text)
+                except Exception:
+                    _LOGGER.exception("Error in transcript callback")
+            elif text:
+                _LOGGER.info("Wyoming WS transcript (no handler): %s", text)
+        else:
+            _LOGGER.debug("Wyoming WS event: type=%s", event_type)
 
     def _handle_close(self, err: "websockets.ConnectionClosed") -> None:
         """Act on the bridge's structured close code before the next reconnect."""
@@ -577,6 +730,16 @@ class WyomingWsClient:
         # Drop any frames still queued: stale real-time audio is useless after a
         # reconnect, so a fresh connection must not replay it.
         self._drain_queue_now()
+
+        # Free any in-flight downlink TTS playback. On reconnect the BFF's
+        # per-satellite ring buffer replays trailing frames, so a fresh START
+        # re-opens the stream cleanly; leaving the old PulseAudio handle open
+        # would leak it.
+        if self._tts_sink is not None:
+            try:
+                await self._tts_sink.close()
+            except Exception:
+                _LOGGER.debug("Wyoming WS: error closing TTS sink", exc_info=True)
 
         if self._ws is not None:
             try:
