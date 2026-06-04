@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import threading
 import time
 import wave
@@ -22,11 +21,8 @@ from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
 from .otel_setup import get_tracer, init_tracing, shutdown_tracing
-from .tts_pcm_server import TtsPcmServer
 from .util import emit_event, get_mac
-from .wyoming_client import WyomingClient
 from .wyoming_ws_client import (
-    WyomingWsClient,
     WyomingWsClientConfig,
     build_realtime_client,
 )
@@ -594,34 +590,9 @@ async def main() -> None:
         help="Jarvis mode: 'wakeword' (default) or 'realtime' (continuous STT via Wyoming/Parakeet)",
     )
     parser.add_argument(
-        "--parakeet-host",
-        default="172.16.5.35",
-        help="Parakeet Wyoming STT server host (default: 172.16.5.35)",
-    )
-    parser.add_argument(
-        "--parakeet-port",
-        type=int,
-        default=10300,
-        help="Parakeet Wyoming STT server port (default: 10300)",
-    )
-    parser.add_argument(
         "--satellite-id",
         default="",
         help="Satellite ID sent to Wyoming server for identification",
-    )
-    parser.add_argument(
-        "--callback-host",
-        default="",
-        help="LAN host where the Response Handler should dial back PCM/TEXT "
-             "frames (must be reachable from RH). Empty = no auto-register.",
-    )
-    parser.add_argument(
-        "--callback-port",
-        type=int,
-        default=0,
-        help="LAN TCP port for callbacks (mirrors --tts-pcm-port). "
-             "0 = fall back to --tts-pcm-port if --callback-host is set; "
-             "if --callback-host is empty no auto-register info is sent.",
     )
     parser.add_argument(
         "--realtime-prebuffer-ms",
@@ -630,15 +601,16 @@ async def main() -> None:
         help="Pre-buffer duration in ms to prepend on VAD trigger (captures onset consonants). Default: 300",
     )
 
-    # BFF WSS uplink (JR4-166 M1). When --bff-url is set the realtime client
-    # connects to the central BFF gateway over WSS instead of dialing Parakeet
-    # directly over TCP. Rollback-safe: empty --bff-url keeps the legacy TCP path.
+    # BFF WSS uplink (JR4-166). SmartSpot's single uplink transport: the
+    # realtime client always connects to the central BFF gateway over WSS, which
+    # byte-passes the Wyoming wire to Parakeet. Mandatory — there is no direct-TCP
+    # fallback. Absence is a fatal error (see _resolve below).
     parser.add_argument(
         "--bff-url",
         default=os.environ.get("BFF_URL", ""),
-        help="BFF Wyoming WSS endpoint, e.g. wss://jarvis-voice.megaira.de/v1/wyoming. "
-             "When set, the realtime client uses WSS-via-BFF instead of direct TCP to "
-             "Parakeet (env: BFF_URL). Empty = legacy direct-TCP path.",
+        help="REQUIRED. BFF Wyoming WSS endpoint, e.g. "
+             "wss://jarvis-voice.megaira.de/v1/wyoming (env: BFF_URL). The realtime "
+             "client uplinks through the BFF over WSS; there is no direct-TCP path.",
     )
     parser.add_argument(
         "--bff-auth-enabled",
@@ -669,14 +641,7 @@ async def main() -> None:
         default=os.environ.get("OIDC_AUDIENCE", "svc:voice"),
         help="OIDC audience/scope requested for the BFF (env: OIDC_AUDIENCE, default svc:voice).",
     )
-
-    # TTS PCM server
-    parser.add_argument(
-        "--tts-pcm-port",
-        type=int,
-        default=9090,
-        help="TCP port for TTS PCM audio server (0 = disabled, default: 9090)",
-    )
+    # PulseAudio sink for the multiplexed-WSS-downlink TTS playback (JR4-166 M2).
     parser.add_argument(
         "--tts-pcm-sink",
         default="smartspot_ec_sink",
@@ -749,10 +714,6 @@ async def main() -> None:
         global _otel_tracer
         from .otel_setup import get_tracer as _get_tracer
         _otel_tracer = _get_tracer(__name__)
-        # Re-init the TTS PCM server tracer as well
-        from .tts_pcm_server import _tracer as _pcm_tracer_ref
-        import linux_voice_assistant.tts_pcm_server as _pcm_mod
-        _pcm_mod._tracer = _get_tracer("tts_pcm_server")
 
     # Import soundcard with retry - PulseAudio may not be ready yet after boot
     sc = None
@@ -947,8 +908,6 @@ async def main() -> None:
         va_mode=va_mode,
         jarvis_mode=jarvis_mode,
         satellite_id=args.satellite_id,
-        parakeet_host=args.parakeet_host,
-        parakeet_port=args.parakeet_port,
         local_vad_aggressiveness=args.local_vad_aggressiveness,
         local_vad_frame_ms=args.local_vad_frame_ms,
         local_vad_min_speech_ms=args.local_vad_min_speech_ms,
@@ -995,14 +954,6 @@ async def main() -> None:
     # Start Wyoming realtime client if jarvis_mode == "realtime"
     if state.jarvis_mode == "realtime":
         _LOGGER.info("Starting Wyoming realtime client (mode=realtime)")
-        # Derive callback target: explicit --callback-port wins; if missing
-        # but --callback-host is set, fall back to --tts-pcm-port (default 9090).
-        # When --callback-host is empty no auto-register hints are advertised.
-        _cb_host = args.callback_host or ""
-        if _cb_host:
-            _cb_port = args.callback_port if args.callback_port > 0 else args.tts_pcm_port
-        else:
-            _cb_port = 0
 
         def _on_transcript(text: str) -> None:
             _LOGGER.info("Realtime transcript: %s", text)
@@ -1015,40 +966,43 @@ async def main() -> None:
                 _LOGGER.warning("Wyoming: disconnected — emitting error LED")
                 emit_event(state, "error")
 
-        # JR4-166 M1: when --bff-url is set, route the uplink through the central
-        # BFF gateway over WSS instead of dialing Parakeet directly over TCP.
-        # The legacy TCP path stays behind the flag for one-release rollback.
-        # The resolved BFF config + callback target are stashed on ServerState so
-        # a runtime HA mode toggle (_manage_wyoming_client) rebuilds the same
-        # WSS-or-TCP client via the shared factory — selection logic lives in one
-        # place (build_realtime_client).
-        bff_config: Optional[WyomingWsClientConfig] = None
-        if args.bff_url:
-            _LOGGER.info("Realtime uplink via BFF WSS: %s", args.bff_url)
-            bff_config = WyomingWsClientConfig(
-                bff_url=args.bff_url,
-                satellite_id=state.satellite_id,
-                callback_host=_cb_host,
-                callback_port=_cb_port,
-                auth_enabled=args.bff_auth_enabled,
-                oidc_token_url=args.oidc_token_url,
-                oidc_client_id=args.oidc_client_id,
-                oidc_client_secret=args.oidc_client_secret,
-                oidc_audience=args.oidc_audience,
+        # JR4-166: the uplink always routes through the central BFF gateway over
+        # the multiplexed WSS /v1/satellite/link/{id} socket — mic audio rides the
+        # 0x00 uplink channel and TTS comes back on the 0x01 downlink channel into
+        # the link client's TtsPlaybackSink. The BFF auto-registers
+        # delivery_mode=wss, so SmartSpot advertises no LAN callback. The resolved
+        # BFF config is stashed on ServerState so a runtime HA mode toggle
+        # (_manage_wyoming_client) rebuilds the identical client via the shared
+        # factory.
+        #
+        # --bff-url is mandatory: there is no direct-TCP fallback transport. Fail
+        # fast with a clear error rather than silently starting a client that can
+        # never connect.
+        if not args.bff_url:
+            raise SystemExit(
+                "realtime mode requires --bff-url (or BFF_URL): the WSS uplink to "
+                "the BFF gateway is SmartSpot's only transport — there is no "
+                "direct-TCP fallback. Set --bff-url to the BFF Wyoming WSS endpoint "
+                "(e.g. wss://jarvis-voice.megaira.de/v1/wyoming)."
             )
 
-        state.bff_config = bff_config
-        state.callback_host = _cb_host
-        state.callback_port = _cb_port
+        _LOGGER.info("Realtime uplink via BFF WSS: %s", args.bff_url)
+        bff_config = WyomingWsClientConfig(
+            bff_url=args.bff_url,
+            satellite_id=state.satellite_id,
+            auth_enabled=args.bff_auth_enabled,
+            oidc_token_url=args.oidc_token_url,
+            oidc_client_id=args.oidc_client_id,
+            oidc_client_secret=args.oidc_client_secret,
+            oidc_audience=args.oidc_audience,
+            tts_sink=args.tts_pcm_sink,
+        )
 
-        wyoming_rt_client: Union[WyomingClient, WyomingWsClient]
+        state.bff_config = bff_config
+
         wyoming_rt_client = build_realtime_client(
             bff_config=bff_config,
-            parakeet_host=state.parakeet_host,
-            parakeet_port=state.parakeet_port,
             satellite_id=state.satellite_id,
-            callback_host=_cb_host,
-            callback_port=_cb_port,
             on_transcript=_on_transcript,
             on_connection_state=_on_connection_state,
         )
@@ -1093,11 +1047,9 @@ async def main() -> None:
 
     reaper_task = asyncio.ensure_future(_reap_zombies())
 
-    # Start TTS PCM server if enabled
-    tts_pcm: Optional[TtsPcmServer] = None
-    if args.tts_pcm_port > 0:
-        tts_pcm = TtsPcmServer(port=args.tts_pcm_port, sink=args.tts_pcm_sink)
-        await tts_pcm.start()
+    # JR4-166 M2: TTS arrives on the multiplexed BFF link (0x01 downlink channel)
+    # and is played by the link client's TtsPlaybackSink — there is no separate
+    # PCM server and the RH never dials back over LAN TCP.
 
     try:
         async with server:
@@ -1107,13 +1059,6 @@ async def main() -> None:
         pass
     finally:
         reaper_task.cancel()
-
-        # Stop TTS PCM server
-        if tts_pcm is not None:
-            try:
-                await tts_pcm.stop()
-            except Exception:
-                _LOGGER.exception("Failed to stop TTS PCM server during shutdown")
 
         # Stop sender thread cleanly
         try:

@@ -350,18 +350,23 @@ class VoiceSatelliteProtocol(APIServer):
                     _LOGGER.warning("Wyoming: disconnected — emitting error LED")
                     emit_event(self.state, "error")
 
-            # JR4-166 M1: honor --bff-url on a runtime mode toggle too. The
-            # shared factory picks WSS-via-BFF when bff_config was stashed at
-            # boot, else the legacy direct-TCP client — same selection logic as
-            # __main__.py. The 4011 STT-down LED feedback rides on whichever
-            # client is built via the on_connection_state callback.
+            # JR4-166: build the multiplexed WSS link client from the bff_config
+            # stashed at boot (mandatory; SmartSpot has no direct-TCP fallback).
+            # If realtime mode was never entered at boot (e.g. started in
+            # wakeword mode) the config is absent — refuse the toggle rather than
+            # build a half-configured client. The 4011 STT-down LED feedback
+            # rides on the on_connection_state callback.
+            bff_config = getattr(self.state, "bff_config", None)
+            if bff_config is None:
+                _LOGGER.error(
+                    "Cannot start realtime client: no BFF config available "
+                    "(--bff-url was not set at boot). Realtime mode requires the "
+                    "WSS uplink to the BFF."
+                )
+                return
             client = build_realtime_client(
-                bff_config=getattr(self.state, "bff_config", None),
-                parakeet_host=self.state.parakeet_host,
-                parakeet_port=self.state.parakeet_port,
+                bff_config=bff_config,
                 satellite_id=self.state.satellite_id,
-                callback_host=getattr(self.state, "callback_host", ""),
-                callback_port=getattr(self.state, "callback_port", 0),
                 on_transcript=_on_transcript,
                 on_connection_state=_on_connection_state,
             )

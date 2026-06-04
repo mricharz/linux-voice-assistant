@@ -96,21 +96,13 @@ class ServerState:
     va_mode: str = "ha"
     jarvis_mode: str = "wakeword"
 
-    # Wyoming/Parakeet realtime STT settings
+    # Wyoming realtime STT settings
     satellite_id: str = ""
-    parakeet_host: str = "172.16.5.35"
-    parakeet_port: int = 10300
 
-    # BFF WSS uplink config (JR4-166 M1). Stashed at boot from --bff-url et al.
-    # When set (non-empty bff_url), the realtime client routes via the BFF over
-    # WSS; this lets a runtime HA mode toggle honor --bff-url too, not just boot.
+    # BFF WSS uplink config (JR4-166). Stashed at boot from --bff-url et al. so a
+    # runtime HA mode toggle rebuilds the identical WSS link client. SmartSpot's
+    # only uplink transport — there is no direct-TCP fallback.
     bff_config: "Optional[WyomingWsClientConfig]" = None
-
-    # Resolved auto-register callback target (LAN where the Response Handler
-    # dials back PCM/TEXT). Stashed at boot so a runtime toggle rebuilds the
-    # realtime client with the same callback advertised at startup.
-    callback_host: str = ""
-    callback_port: int = 0
 
     # Local VAD tuning (used when va_mode == "local")
     local_vad_aggressiveness: int = 2  # 0..3
