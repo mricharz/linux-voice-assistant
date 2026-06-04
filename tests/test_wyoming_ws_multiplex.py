@@ -37,7 +37,6 @@ def _wss_config(**overrides):
         satellite_id="client:jarvis-svc-smartspot:smartspot",
         auth_enabled=False,
         reconnect_jitter=0.0,
-        read_timeout=1.0,
     )
     base.update(overrides)
     return WyomingWsClientConfig(**base)

@@ -18,8 +18,8 @@ Control events are JSON-line text WS frames (built by ``_build_event`` from
 forwards both text and binary verbatim. Inbound ``transcript`` events arrive as
 message-framed WS payloads and are parsed with ``_parse_event``.
 
-Python 3.9 compatible — uses ``asyncio.wait_for`` (not ``asyncio.timeout``), no
-``X | Y`` runtime unions, no structural ``match``.
+Python 3.9 compatible — no ``asyncio.timeout``, no ``X | Y`` runtime unions, no
+structural ``match``.
 """
 
 import asyncio
@@ -48,18 +48,34 @@ _LOGGER = logging.getLogger(__name__)
 _otel_tracer = get_tracer("wyoming_ws_client")
 
 # Frame-channel header bytes for the multiplexed /v1/satellite/link/{id} socket
-# (JR4-166 M2, §3.1). The 1-byte channel marker sits at offset 0 of every frame;
-# the channel-specific payload follows at offset 1.
+# (JR4-166 M2/M2.x, §2.1 of the Satellite Control Protocol). The 1-byte channel
+# marker sits at offset 0 of every frame; the channel-specific payload follows at
+# offset 1.
 #   0x00 WYOMING       uplink: mic audio + Wyoming control events (satellite→BFF)
 #   0x01 DOWNLINK_TTS  downlink: one PcmClient TTS frame (BFF→satellite)
-#   0x02..0x0F         reserved for M3 control (dropped here, never closes)
+#   0x02 HEARTBEAT     uplink keepalive (satellite→BFF): a bare 1-byte frame the
+#                      BFF forwards to RH POST /v1/satellites/heartbeat to refresh
+#                      the registration between (now-rare) reconnects (M2.x).
+#   0x03..0x0F         reserved for M3 control (dropped here, never closes)
 _CHANNEL_WYOMING = 0x00
 _CHANNEL_DOWNLINK_TTS = 0x01
+_CHANNEL_HEARTBEAT = 0x02
 # Single reusable 1-byte prefix buffer for the uplink channel marker. Prepending
 # it is a one-byte ``bytes`` concat per frame — cheap on the Pi, and the only
 # alloc the multiplex adds to the uplink hot path (the alternative, a per-frame
 # bytearray with an inserted byte, is no cheaper and loses _build_event reuse).
 _CHANNEL_WYOMING_PREFIX = bytes([_CHANNEL_WYOMING])
+
+# Single reusable 1-byte HEARTBEAT control frame (channel 0x02, no payload). The
+# heartbeat task re-sends this exact same object every _HEARTBEAT_INTERVAL_S; the
+# BFF translates it to an RH heartbeat POST keyed by the connection's own
+# satellite_id (the frame carries nothing — zero spoofing surface).
+_CHANNEL_HEARTBEAT_FRAME = bytes([_CHANNEL_HEARTBEAT])
+
+# Heartbeat cadence. Pinned ≪ the BFF registration TTL (90s) — 3× slack tolerates
+# two missed beats before a live registration would expire (see the M2.x plan
+# §6). Do NOT raise this toward the TTL.
+_HEARTBEAT_INTERVAL_S = 30.0
 
 # Structured close codes emitted by the BFF Wyoming bridge.
 _WS_CLOSE_AUTH = 4001  # token invalid/expired -> refresh + reconnect
@@ -117,11 +133,10 @@ class WyomingWsClientConfig:
     reconnect_multiplier: float = 2.0
     reconnect_jitter: float = 0.5
 
-    # Read timeout — reconnect if nothing received within this period.
-    read_timeout: float = 60.0
-
     # WS-level keepalive ping (the bridge pings every 30s; we add our own when
-    # idle so a half-open socket is detected from our side too).
+    # idle so a half-open socket is detected from our side too). This protocol-
+    # layer ping/pong — NOT an app-level read timeout — owns liveness: no PONG
+    # within ping_timeout raises ConnectionClosed from recv() → reconnect (M2.x).
     ping_interval: float = 30.0
     ping_timeout: float = 60.0
 
@@ -221,6 +236,12 @@ class WyomingWsClient:
             maxsize=_SEND_QUEUE_MAXSIZE
         )
         self._drain_task: Optional[asyncio.Task] = None
+        # Dedicated periodic task that sends the 0x02 HEARTBEAT control frame
+        # directly on the socket (NOT via the drop-oldest send queue — liveness
+        # must not share fate with droppable audio). Tied to the connection
+        # lifecycle exactly like the drain task: created in ``_connect_and_listen``,
+        # cancelled + nulled in ``_close_connection``.
+        self._heartbeat_task: Optional[asyncio.Task] = None
         # Monotonic timestamp of the last emitted drop warning (rate-limiting).
         self._last_drop_warn: float = 0.0
 
@@ -393,6 +414,40 @@ class WyomingWsClient:
                 _LOGGER.debug("Wyoming WS send failed, connection may be lost")
                 self._connected = False
 
+    async def _heartbeat_loop(self, ws: Any) -> None:
+        """Send the 0x02 HEARTBEAT control frame every ~30s while connected.
+
+        The Satellite Control Protocol keepalive (M2.x, §2.1): a bare 1-byte
+        ``[0x02]`` frame UP the /link/ socket. The BFF forwards it to RH's
+        heartbeat endpoint (keyed by the connection's own satellite_id) so the
+        registration stays fresh between (now-rare) reconnects, enabling a low
+        TTL.
+
+        Sent DIRECTLY on ``ws`` — never through the bounded drop-oldest send
+        queue — so liveness cannot be silently discarded behind an audio backlog.
+        ``ws`` is captured as a PARAMETER (mirroring ``_drain_send_queue``) so a
+        stale task can never send on a new socket after ``_close_connection``
+        cancels it. Sleep-before-send: the first beat is at +30s — the accept-time
+        BFF auto-register already seeds the registration, so an immediate beat
+        would be redundant.
+
+        A send failure (the socket went away under us) clears ``self._connected``
+        and returns, propagating to the read/reconnect side which tears the
+        connection down — it does NOT swallow the error into a dead retry loop.
+        """
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+            try:
+                await ws.send(_CHANNEL_HEARTBEAT_FRAME)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.debug(
+                    "Wyoming WS heartbeat send failed, connection may be lost"
+                )
+                self._connected = False
+                return
+
     async def _connection_loop(self) -> None:
         """Reconnect loop with exponential backoff and jitter."""
         delay = self._config.reconnect_min_delay
@@ -528,6 +583,11 @@ class WyomingWsClient:
         # _drain_task is None here and the queue carries no stale frames.
         self._drain_task = asyncio.ensure_future(self._drain_send_queue(self._ws))
 
+        # Start the dedicated 0x02 heartbeat task for this connection (separate
+        # from the audio drain queue — see _heartbeat_loop). Captures the live ws
+        # so a cancelled-but-stale task can never beat on a new socket.
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(self._ws))
+
         # Send info event with satellite identification. Passed through the BFF
         # to Parakeet verbatim. No LAN callback target is advertised: TTS rides
         # the downlink (0x01) on this same socket and the BFF auto-registers
@@ -556,17 +616,13 @@ class WyomingWsClient:
 
         while self._running and self._connected:
             try:
-                message = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=self._config.read_timeout,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Wyoming WS: read timeout (%.0fs), reconnecting",
-                    self._config.read_timeout,
-                )
-                self._connected = False
-                break
+                # No app-level read timeout: liveness is owned by the protocol
+                # layer (websockets ping_interval/ping_timeout, configured at
+                # connect). A dead socket (no PONG within ping_timeout, or a half-
+                # open downlink) raises ConnectionClosed from recv() below →
+                # reconnect. A genuinely quiet-but-alive socket simply waits here,
+                # which is correct — idle no longer churns the connection (M2.x).
+                message = await ws.recv()
             except asyncio.CancelledError:
                 raise
             except websockets.ConnectionClosed as err:
@@ -685,6 +741,20 @@ class WyomingWsClient:
                 # Drain task should swallow send errors itself; be defensive.
                 _LOGGER.debug("Wyoming WS: drain task ended with error")
             self._drain_task = None
+
+        # Cancel the heartbeat task on the same lifecycle as the drain task so it
+        # never beats on a closed/new socket and is not leaked across reconnects
+        # (no "Task exception never retrieved").
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # Heartbeat loop swallows send errors itself; be defensive.
+                _LOGGER.debug("Wyoming WS: heartbeat task ended with error")
+            self._heartbeat_task = None
 
         # Drop any frames still queued: stale real-time audio is useless after a
         # reconnect, so a fresh connection must not replay it.
