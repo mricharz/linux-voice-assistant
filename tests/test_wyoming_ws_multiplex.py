@@ -1,13 +1,12 @@
 """Tests for the multiplexed satellite-link transport (JR4-166 M2).
 
-Covers the M2 deltas on top of the M1 ``WyomingWsClient``:
-  * uplink ``0x00`` channel prefix — and parity: prefix + payload == the M1
-    event bytes byte-for-byte (info/audio-start/audio-chunk/audio-stop);
+The link is always multiplexed. Covers:
+  * uplink ``0x00`` channel prefix — and parity: prefix + payload == the bare
+    ``_build_event`` bytes byte-for-byte (info/audio-start/audio-chunk/audio-stop);
   * downlink demux on the SAME socket: a ``0x01`` binary message strips the
     channel byte and drives the TTS sink; ``0x00`` drives the transcript path;
   * the ``/v1/satellite/link/{satellite_id}`` connect-URL resolution incl. the
-    namespaced (colon-bearing) id;
-  * lan-mode (M1) leaves the uplink bytes unprefixed (no regression).
+    namespaced (colon-bearing) id.
 """
 
 import asyncio
@@ -16,8 +15,8 @@ import struct
 from unittest.mock import MagicMock
 
 import linux_voice_assistant.wyoming_ws_client as ws_mod
-from linux_voice_assistant.tts_pcm_server import _MSG_START
-from linux_voice_assistant.wyoming_client import (
+from linux_voice_assistant.pcm_playback import _MSG_START
+from linux_voice_assistant.wyoming_protocol import (
     _EVENT_AUDIO_CHUNK,
     _EVENT_AUDIO_START,
     _EVENT_AUDIO_STOP,
@@ -37,7 +36,6 @@ def _wss_config(**overrides):
         bff_url="wss://localhost/v1/wyoming",
         satellite_id="client:jarvis-svc-smartspot:smartspot",
         auth_enabled=False,
-        downlink_mode="wss",
         reconnect_jitter=0.0,
         read_timeout=1.0,
     )
@@ -45,19 +43,8 @@ def _wss_config(**overrides):
     return WyomingWsClientConfig(**base)
 
 
-def _lan_config(**overrides):
-    base = dict(
-        bff_url="wss://localhost/v1/wyoming",
-        satellite_id="smartspot",
-        auth_enabled=False,
-        downlink_mode="lan",
-    )
-    base.update(overrides)
-    return WyomingWsClientConfig(**base)
-
-
 # ---------------------------------------------------------------------------
-# Uplink: 0x00 channel prefix + byte-for-byte parity with the M1 event bytes
+# Uplink: 0x00 channel prefix + byte-for-byte parity with the bare event bytes
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +103,7 @@ def test_uplink_prefix_audio_start_parity():
 
 
 def test_uplink_prefix_audio_chunk_parity():
-    """audio-chunk: 0x00 + M1 chunk bytes (incl. binary payload), byte-for-byte."""
+    """audio-chunk: 0x00 + chunk bytes (incl. binary payload), byte-for-byte."""
     chunk = b"\x01\x02\x03\x04" * 80
 
     def _act(c):
@@ -135,7 +122,7 @@ def test_uplink_prefix_audio_chunk_parity():
 
 
 def test_uplink_prefix_audio_stop_parity():
-    """audio-stop: 0x00 + M1 stop bytes."""
+    """audio-stop: 0x00 + stop bytes."""
 
     def _act(c):
         c._utterance_active = True
@@ -148,7 +135,7 @@ def test_uplink_prefix_audio_stop_parity():
 
 
 def test_uplink_info_parity(monkeypatch):
-    """The real info-frame emission on connect is 0x00 + the M1 info bytes."""
+    """The real info-frame emission on connect is 0x00 + the bare info bytes."""
     cfg = _wss_config(satellite_id="sat-1")
     expected = bytes([_CHANNEL_WYOMING]) + _build_event(
         _EVENT_INFO, data={"satellite_id": "sat-1"}
@@ -180,17 +167,6 @@ def test_uplink_info_parity(monkeypatch):
     assert sent
     # info is sent directly (not via the queue), so it is the first send.
     assert sent[0] == expected
-
-
-def test_lan_mode_uplink_unprefixed_no_regression():
-    """downlink_mode='lan' must NOT prefix — bytes stay byte-identical to M1."""
-    client = WyomingWsClient(_lan_config())
-    sent = _run_uplink(client, lambda c: c.start_utterance())
-    assert len(sent) == 1
-    # No channel byte: the frame starts with the JSON header '{'.
-    assert sent[0][:1] == b"{"
-    header = json.loads(sent[0].split(b"\n", 1)[0])
-    assert header["type"] == _EVENT_AUDIO_START
 
 
 # ---------------------------------------------------------------------------
@@ -295,11 +271,10 @@ def test_downlink_reserved_channel_dropped_no_close():
     assert sink_calls == []  # reserved channel never reaches the sink
 
 
-def test_lan_mode_has_no_tts_sink():
-    """lan mode builds no TTS sink (downlink stays on the :9090 server)."""
-    client = WyomingWsClient(_lan_config())
-    assert client._tts_sink is None
-    assert client._multiplex is False
+def test_client_always_has_tts_sink():
+    """The link is always multiplexed, so the downlink TTS sink always exists."""
+    client = WyomingWsClient(_wss_config())
+    assert client._tts_sink is not None
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +283,7 @@ def test_lan_mode_has_no_tts_sink():
 
 
 def test_link_url_derived_from_satellite_id():
-    """wss mode rewrites the path to /v1/satellite/link/{namespaced-id}."""
+    """The path is rewritten to /v1/satellite/link/{namespaced-id}."""
     cfg = _wss_config(
         bff_url="wss://jarvis-voice.megaira.de/v1/wyoming",
         satellite_id="client:jarvis-svc-smartspot:smartspot",
@@ -331,8 +306,11 @@ def test_link_url_base_without_path():
     )
 
 
-def test_lan_url_is_verbatim():
-    """lan mode connects to bff_url verbatim (M1, /v1/wyoming)."""
-    cfg = _lan_config(bff_url="wss://jarvis-voice.megaira.de/v1/wyoming")
+def test_link_url_empty_satellite_id_raises():
+    """An empty satellite_id has no link path segment, so dialing must refuse."""
+    import pytest
+
+    cfg = _wss_config(satellite_id="")
     client = WyomingWsClient(cfg)
-    assert client._resolve_connect_url() == "wss://jarvis-voice.megaira.de/v1/wyoming"
+    with pytest.raises(RuntimeError):
+        client._resolve_connect_url()

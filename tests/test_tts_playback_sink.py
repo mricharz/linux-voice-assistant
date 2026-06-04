@@ -12,7 +12,7 @@ import struct
 import pytest
 
 import linux_voice_assistant.tts_playback_sink as sink_mod
-from linux_voice_assistant.tts_pcm_server import (
+from linux_voice_assistant.pcm_playback import (
     _MSG_END,
     _MSG_METADATA,
     _MSG_PCM_DATA,
@@ -23,7 +23,7 @@ from linux_voice_assistant.tts_playback_sink import TtsPlaybackSink
 
 
 # ---------------------------------------------------------------------------
-# Frame builders (mirror the :9090 / outbound-WSS wire layout)
+# Frame builders (mirror the multiplexed-WSS downlink wire layout)
 # ---------------------------------------------------------------------------
 
 

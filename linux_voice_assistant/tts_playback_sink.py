@@ -1,14 +1,11 @@
 """Message-framed TTS playback sink for the multiplexed BFF link (JR4-166 M2).
 
-Sibling of ``tts_pcm_server.TtsPcmServer``. Where ``TtsPcmServer`` owns its own
-TCP listener on ``:9090`` and reassembles a byte STREAM into PcmClient frames via
-``readexactly``, this sink is driven by a MESSAGE-framed transport: the
-multiplexed ``/v1/satellite/link/{id}`` WSS delivers exactly ONE PcmClient frame
-per WS message (after the BFF strips the ``0x01`` channel byte). So the frame FSM
-collapses to a single dispatch on ``frame[0]`` — no stream reassembly, no
-``readexactly``.
+The multiplexed ``/v1/satellite/link/{id}`` WSS delivers exactly ONE PcmClient
+frame per WS message (after the BFF strips the ``0x01`` channel byte). So the
+frame FSM collapses to a single dispatch on ``frame[0]`` — no stream reassembly,
+no ``readexactly``.
 
-Binary protocol (identical to ``tts_pcm_server`` / the legacy ``:9090`` path):
+Binary protocol:
     START    = 0x01 + 4 bytes sample_rate (u32 LE)  [+ optional trailing METADATA]
     PCM_DATA = 0x02 + 4 bytes length (u32 LE) + PCM bytes
     END      = 0x03  (drain + free)
@@ -18,9 +15,9 @@ Binary protocol (identical to ``tts_pcm_server`` / the legacy ``:9090`` path):
 Audio format: s16le mono, sample rate from the START frame.
 
 The load-bearing PulseAudio binding (``_PulsePlayback``, a libpulse-simple ctypes
-wrapper) is REUSED VERBATIM from ``tts_pcm_server`` — only the framing source
-changes here. Blocking ``pa_simple_*`` calls run on the default executor so they
-never block the asyncio loop (mirrors ``TtsPcmServer``).
+wrapper) and the ``_MSG_*`` frame constants come from the shared
+:mod:`pcm_playback` module. Blocking ``pa_simple_*`` calls run on the default
+executor so they never block the asyncio loop.
 
 Python 3.9 compatible — no ``X | Y`` runtime unions, no structural ``match``,
 ``asyncio.get_running_loop`` only inside coroutines.
@@ -34,7 +31,7 @@ import time
 from typing import Any, Optional
 
 from .otel_setup import get_tracer
-from .tts_pcm_server import (
+from .pcm_playback import (
     _MSG_END,
     _MSG_METADATA,
     _MSG_PCM_DATA,
@@ -54,8 +51,7 @@ class TtsPlaybackSink:
     lifetime: each inbound ``0x01`` downlink WS message hands its bare PcmClient
     frame (channel byte already stripped) to :meth:`handle_frame`. The sink keeps
     the in-flight playback session state (the open ``_PulsePlayback`` stream, OTel
-    span, counters) across frames exactly like ``TtsPcmServer``'s inner loop, but
-    re-entered per message instead of per ``readexactly``.
+    span, counters) across frames, re-entered per message.
 
     Thread model: all ``handle_frame`` calls run on the asyncio loop thread (the
     link client's listen loop). Blocking ``pa_simple_*`` ops are offloaded to the
@@ -65,8 +61,8 @@ class TtsPlaybackSink:
     def __init__(self, sink: Optional[str] = None) -> None:
         self._sink = sink
 
-        # Active playback session state (mirrors TtsPcmServer's inner-loop locals,
-        # hoisted to instance fields because each frame is a separate call).
+        # Active playback session state, hoisted to instance fields because each
+        # frame is a separate call.
         self._playback: Optional[_PulsePlayback] = None
         self._session_span: Any = None
         self._session_span_ctx: Any = None
@@ -104,8 +100,7 @@ class TtsPlaybackSink:
                 self._on_metadata(frame)
             else:
                 # Unknown opcode (e.g. TEXT 0x06, which SmartSpot has never
-                # played) — mirror TtsPcmServer's "Unexpected message type"
-                # branch: warn + ignore, do not tear the session down.
+                # played) — warn + ignore, do not tear the session down.
                 _LOGGER.warning(
                     "TTS sink: unexpected frame opcode 0x%02x, ignoring", opcode
                 )
@@ -149,8 +144,7 @@ class TtsPlaybackSink:
         remote_context: Any = None
 
         # Open the PulseAudio stream (blocking → executor). Fall back to the
-        # default sink if the configured sink is unavailable, mirroring
-        # TtsPcmServer.
+        # default sink if the configured sink is unavailable.
         loop = asyncio.get_running_loop()
         playback = await loop.run_in_executor(None, self._open_playback, sample_rate)
         if playback is None:
@@ -228,8 +222,7 @@ class TtsPlaybackSink:
     def _open_playback(self, sample_rate: int) -> Optional[_PulsePlayback]:
         """Open a PulseAudio stream (blocking; runs in the executor).
 
-        Falls back to the default sink if the configured sink is unavailable,
-        mirroring ``TtsPcmServer._handle_client``.
+        Falls back to the default sink if the configured sink is unavailable.
         """
         try:
             return _PulsePlayback(sample_rate, sink=self._sink)

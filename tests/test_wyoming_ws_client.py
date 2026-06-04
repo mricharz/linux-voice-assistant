@@ -1,9 +1,10 @@
-"""Tests for the Wyoming WSS-via-BFF client (JR4-166 M1).
+"""Tests for the Wyoming WSS-via-BFF client (JR4-166).
 
 Covers: config defaults / backoff curve, read-timeout reconnect,
 backoff-reset-after-stable, close-code -> token-refresh path, OIDC token
-caching, and frame encode parity with the TCP transport. No live token or
-network is required — all I/O is faked.
+caching, the bounded send queue + drain task, and frame encode parity (the
+channel-prefixed remainder is byte-identical to ``_build_event``). No live token
+or network is required — all I/O is faked.
 """
 
 import asyncio
@@ -14,15 +15,15 @@ import pytest
 import websockets
 
 import linux_voice_assistant.wyoming_ws_client as ws_mod
-from linux_voice_assistant.wyoming_client import (
+from linux_voice_assistant.wyoming_protocol import (
     _EVENT_AUDIO_CHUNK,
     _EVENT_AUDIO_START,
     _EVENT_AUDIO_STOP,
     _EVENT_INFO,
-    WyomingClient,
     _build_event,
 )
 from linux_voice_assistant.wyoming_ws_client import (
+    _CHANNEL_WYOMING,
     _WS_CLOSE_AUDIENCE,
     _WS_CLOSE_AUTH,
     _WS_CLOSE_UPSTREAM_REFUSED,
@@ -48,7 +49,7 @@ def config():
 
 
 # ---------------------------------------------------------------------------
-# Config / resilience knobs (mirror WyomingClientConfig requirements)
+# Config / resilience knobs (backoff curve, read timeout per CLAUDE.md)
 # ---------------------------------------------------------------------------
 
 
@@ -214,11 +215,15 @@ def test_frame_parity_audio_start(config):
 
     sent = asyncio.run(_run())
     assert len(sent) == 1
-    header = json.loads(sent[0].split(b"\n", 1)[0])
+    # Every uplink frame carries the 0x00 WYOMING channel prefix; the remainder
+    # is byte-identical to a bare _build_event.
+    assert sent[0][0] == _CHANNEL_WYOMING
+    payload = sent[0][1:]
+    header = json.loads(payload.split(b"\n", 1)[0])
     assert header["type"] == _EVENT_AUDIO_START
-    data = json.loads(sent[0].split(b"\n", 1)[1])
+    data = json.loads(payload.split(b"\n", 1)[1])
     assert data["rate"] == 16000 and data["width"] == 2 and data["channels"] == 1
-    assert sent[0] == _build_event(_EVENT_AUDIO_START, data=data)
+    assert payload == _build_event(_EVENT_AUDIO_START, data=data)
 
 
 def test_frame_parity_audio_chunk(config):
@@ -235,7 +240,7 @@ def test_frame_parity_audio_chunk(config):
 
     sent = asyncio.run(_run())
     assert len(sent) == 1
-    expected = _build_event(
+    expected = bytes([_CHANNEL_WYOMING]) + _build_event(
         _EVENT_AUDIO_CHUNK,
         data={"rate": 16000, "width": 2, "channels": 1},
         payload=chunk,
@@ -256,30 +261,24 @@ def test_frame_parity_audio_stop(config):
 
     sent = asyncio.run(_run())
     assert len(sent) == 1
-    assert sent[0] == _build_event(_EVENT_AUDIO_STOP)
+    assert sent[0] == bytes([_CHANNEL_WYOMING]) + _build_event(_EVENT_AUDIO_STOP)
 
 
 def test_frame_parity_info(monkeypatch):
-    """The client's REAL info-frame emission is byte-identical to the TCP path.
+    """The client's REAL info-frame emission carries the channel prefix.
 
-    Drives ``_connect_and_listen`` so the actual info-build code (the
-    ``if callback_host and callback_port`` guard path) runs, rather than
-    re-deriving the payload inline — so a regression in that real code is caught.
+    Drives ``_connect_and_listen`` so the actual info-build code runs, rather
+    than re-deriving the payload inline — so a regression in that real code is
+    caught. The link advertises no LAN callback (TTS rides the downlink).
     """
     cfg = WyomingWsClientConfig(
         bff_url="wss://localhost/v1/wyoming",
         satellite_id="sat-1",
-        callback_host="192.168.1.5",
-        callback_port=9090,
         auth_enabled=False,
     )
-    expected = _build_event(
+    expected = bytes([_CHANNEL_WYOMING]) + _build_event(
         _EVENT_INFO,
-        data={
-            "satellite_id": "sat-1",
-            "callback_host": "192.168.1.5",
-            "callback_port": 9090,
-        },
+        data={"satellite_id": "sat-1"},
     )
 
     async def _run():
@@ -326,7 +325,8 @@ def test_write_raw_enqueues_without_task_alloc(config):
     payload = b"hello-frame"
     client._write_raw(payload)
     assert client._send_queue.qsize() == 1
-    assert client._send_queue.get_nowait() == payload
+    # Every uplink frame is prefixed with the 0x00 WYOMING channel byte.
+    assert client._send_queue.get_nowait() == bytes([_CHANNEL_WYOMING]) + payload
 
 
 def test_write_raw_noop_when_disconnected(config):
@@ -343,6 +343,7 @@ def test_drop_oldest_on_queue_overflow(config):
     client._ws = MagicMock()
 
     cap = ws_mod._SEND_QUEUE_MAXSIZE
+    pfx = bytes([_CHANNEL_WYOMING])  # every uplink frame is channel-prefixed
     # Fill exactly to capacity with identifiable frames.
     for i in range(cap):
         client._write_raw(b"frame-%05d" % i)
@@ -356,9 +357,9 @@ def test_drop_oldest_on_queue_overflow(config):
     while not client._send_queue.empty():
         drained.append(client._send_queue.get_nowait())
 
-    assert b"frame-00000" not in drained  # oldest dropped
-    assert b"frame-00001" == drained[0]  # next-oldest now at the head (FIFO)
-    assert drained[-1] == b"newest"  # newest enqueued at the tail
+    assert pfx + b"frame-00000" not in drained  # oldest dropped
+    assert pfx + b"frame-00001" == drained[0]  # next-oldest now at the head (FIFO)
+    assert drained[-1] == pfx + b"newest"  # newest enqueued at the tail
     assert len(drained) == cap
 
 
@@ -396,7 +397,9 @@ def test_drain_fifo_ordering(config):
         return sent, frames
 
     sent, frames = asyncio.run(_run())
-    assert sent == frames  # exact FIFO order preserved
+    # Each frame is channel-prefixed; FIFO order is preserved.
+    pfx = bytes([_CHANNEL_WYOMING])
+    assert sent == [pfx + f for f in frames]
 
 
 def test_drain_send_error_marks_disconnected(config):
@@ -690,41 +693,24 @@ def test_fetch_token_missing_url_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# build_realtime_client factory — transport selection (JR4-166 M1 Pass-1 fix:
-# both boot and the HA runtime mode toggle must pick the same transport).
+# build_realtime_client factory — always builds the WSS client (JR4-166: WSS is
+# SmartSpot's single uplink transport, no direct-TCP fallback exists).
 # ---------------------------------------------------------------------------
 
 
-def _build(bff_config):
-    """Invoke the factory with the standard non-BFF (TCP) args."""
-    return build_realtime_client(
-        bff_config=bff_config,
-        parakeet_host="parakeet.local",
-        parakeet_port=10300,
-        satellite_id="sat-1",
-        callback_host="192.168.1.50",
-        callback_port=9090,
-    )
-
-
-def test_factory_selects_wss_when_bff_url_set():
-    """A config with a non-empty bff_url -> WSS client."""
+def test_factory_builds_wss_client():
+    """The factory always returns the multiplexed WSS link client."""
     cfg = WyomingWsClientConfig(
         bff_url="wss://localhost/v1/wyoming", satellite_id="sat-1"
     )
-    assert isinstance(_build(cfg), WyomingWsClient)
+    client = build_realtime_client(bff_config=cfg, satellite_id="sat-1")
+    assert isinstance(client, WyomingWsClient)
 
 
-def test_factory_selects_tcp_when_no_bff_config():
-    """No bff_config -> legacy direct-TCP client (rollback path)."""
-    client = _build(None)
-    assert isinstance(client, WyomingClient)
-    assert not isinstance(client, WyomingWsClient)
-
-
-def test_factory_selects_tcp_when_bff_url_empty():
-    """A config present but with an empty bff_url -> TCP (defensive)."""
-    cfg = WyomingWsClientConfig(bff_url="", satellite_id="sat-1")
-    client = _build(cfg)
-    assert isinstance(client, WyomingClient)
-    assert not isinstance(client, WyomingWsClient)
+def test_factory_refreshes_satellite_id_onto_config():
+    """The live satellite_id is stamped onto the boot-stashed config."""
+    cfg = WyomingWsClientConfig(
+        bff_url="wss://localhost/v1/wyoming", satellite_id="stale"
+    )
+    build_realtime_client(bff_config=cfg, satellite_id="fresh-id")
+    assert cfg.satellite_id == "fresh-id"
