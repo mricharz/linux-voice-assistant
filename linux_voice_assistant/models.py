@@ -117,6 +117,12 @@ class ServerState:
     vad_rms_threshold: int = 120
     vad_rms_window_ms: int = 150
 
+    # Barge-in persistence window (realtime mode): a vad_start that fires WHILE a
+    # TTS reply is playing must persist this many ms of still-active speech before
+    # it aborts the reply — guards against a single loud transient cutting the
+    # assistant off mid-sentence. 0 fires immediately on vad_start (old behaviour).
+    barge_in_confirm_ms: int = 120
+
     # Entities
     media_player_entity: "Optional[MediaPlayerEntity]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None

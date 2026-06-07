@@ -234,3 +234,73 @@ def test_empty_frame_is_noop(fake_playback):
 
     asyncio.run(_run())
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Barge-in: is_playing reflects session state; barge_in() is idempotent
+# ---------------------------------------------------------------------------
+
+
+def test_is_playing_reflects_session_state(fake_playback):
+    """is_playing flips True on START and False on END/STOP."""
+
+    async def _run():
+        sink = TtsPlaybackSink()
+        assert sink.is_playing is False
+        await sink.handle_frame(_start(16000))
+        assert sink.is_playing is True
+        await sink.handle_frame(_pcm(b"data"))
+        assert sink.is_playing is True
+        await sink.handle_frame(_end())
+        assert sink.is_playing is False
+
+        # STOP path also clears is_playing.
+        await sink.handle_frame(_start(16000))
+        assert sink.is_playing is True
+        await sink.handle_frame(_stop())
+        assert sink.is_playing is False
+
+    asyncio.run(_run())
+
+
+def test_barge_in_stops_without_drain(fake_playback):
+    """barge_in() frees the in-flight stream without draining (like STOP)."""
+    events, _ = fake_playback
+
+    async def _run():
+        sink = TtsPlaybackSink()
+        await sink.handle_frame(_start(16000))
+        await sink.handle_frame(_pcm(b"abcd"))
+        await sink.barge_in()
+        assert sink.is_playing is False
+
+    asyncio.run(_run())
+    assert events == [
+        ("open", 16000),
+        ("write", b"abcd"),
+        ("free", None),  # no ("drain", ...) before free
+    ]
+
+
+def test_barge_in_is_idempotent(fake_playback):
+    """A second barge_in() (and one with no active session) is a safe no-op."""
+    events, _ = fake_playback
+
+    async def _run():
+        sink = TtsPlaybackSink()
+        # No active session: barge_in must not raise and must not open/free.
+        await sink.barge_in()
+        assert events == []
+
+        await sink.handle_frame(_start(16000))
+        await sink.barge_in()
+        # Second call finds nothing playing — no extra free, no exception.
+        await sink.barge_in()
+        assert sink.is_playing is False
+
+    asyncio.run(_run())
+    # Exactly one open + one free across the two barge_in calls.
+    assert events == [
+        ("open", 16000),
+        ("free", None),
+    ]

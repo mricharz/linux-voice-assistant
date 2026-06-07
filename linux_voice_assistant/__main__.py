@@ -17,6 +17,7 @@ from aioesphomeapi.model import VoiceAssistantEventType
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .barge_in import _BargeInArm
 from .local_vad import LocalVADConfig, LocalWebRTCVAD
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .satellite import VoiceSatelliteProtocol
@@ -167,6 +168,14 @@ def process_audio(
     # Realtime mode: VAD-based speech segmentation for Wyoming streaming
     realtime_vad: Optional[LocalWebRTCVAD] = None
     realtime_utterance_active: bool = False
+    # Barge-in: a vad_start during TTS playback arms this persistence countdown
+    # (see _BargeInArm). frame_ms here MUST match the realtime VAD's frame_ms
+    # (30ms, hardcoded below) so the window is the configured duration in chunks.
+    _RT_VAD_FRAME_MS = 30
+    # May be 0 for a sub-frame confirm_ms; _BargeInArm.arm() is the single
+    # load-bearing floor (clamps to >=1 frame), so no max() is needed here.
+    barge_confirm_frames = int(round(state.barge_in_confirm_ms / _RT_VAD_FRAME_MS))
+    barge_in_arm = _BargeInArm()
     # OTel context manager and span for the current realtime utterance (vad_start → vad_end)
     realtime_utterance_span_ctx = None
     realtime_utterance_span = None
@@ -317,6 +326,19 @@ def process_audio(
                                 realtime_prebuffer.clear()
                                 realtime_prebuffer_current_bytes = 0
                                 realtime_utterance_active = True
+                                # Barge-in: if a reply is playing, this vad_start
+                                # may be the user talking over it. Don't stop
+                                # instantly (a loud transient also fires vad_start)
+                                # — arm the persistence countdown, ticked per chunk
+                                # below while the speech stays active. confirm_ms==0
+                                # keeps the old fire-immediately behaviour.
+                                if wyoming_client.tts_playing:
+                                    if state.barge_in_confirm_ms == 0:
+                                        loop.call_soon_threadsafe(
+                                            wyoming_client.barge_in_playback
+                                        )
+                                    else:
+                                        barge_in_arm.arm(barge_confirm_frames)
                             elif ev == "vad_end":
                                 _LOGGER.debug("Realtime VAD: speech end")
                                 loop.call_soon_threadsafe(wyoming_client.end_utterance)
@@ -331,10 +353,34 @@ def process_audio(
                                 realtime_utterance_active = False
                                 realtime_prebuffer.clear()
                                 realtime_prebuffer_current_bytes = 0
+                                # Speech ended before the barge-in window elapsed
+                                # (or after it fired) — disarm for the next
+                                # utterance. No-op when never armed.
+                                # INVARIANT: every ``realtime_utterance_active =
+                                # False`` MUST be paired with ``barge_in_arm.reset()``
+                                # so an armed countdown can never leak across the gap
+                                # between utterances and fire on the next one.
+                                barge_in_arm.reset()
                                 # Reset VAD state so it can detect the next utterance.
                                 # Without this, _speech_ended stays True and the VAD
                                 # silently ignores all subsequent audio.
                                 realtime_vad.reset()
+
+                        # Barge-in persistence countdown. Gated behind ``armed``
+                        # so this is a single cheap bool check on the steady-state
+                        # path (zero cost when not barging in). Only ticks while
+                        # the utterance is still active; firing once at 0 aborts
+                        # the in-flight reply on the loop thread.
+                        if realtime_utterance_active and barge_in_arm.armed:
+                            if barge_in_arm.tick():
+                                _LOGGER.info(
+                                    "Realtime VAD: barge-in confirmed (%dms), "
+                                    "stopping TTS playback",
+                                    state.barge_in_confirm_ms,
+                                )
+                                loop.call_soon_threadsafe(
+                                    wyoming_client.barge_in_playback
+                                )
 
                         # Stream audio during active utterance
                         if realtime_utterance_active:
@@ -727,6 +773,16 @@ async def main() -> None:
              "spike (a dropped remote) doesn't trip it and a brief dip mid-onset "
              "doesn't either. Default: 150",
     )
+    parser.add_argument(
+        "--barge-in-confirm-ms",
+        type=int,
+        default=120,
+        help="Realtime mode: a vad_start that fires WHILE a TTS reply is playing "
+             "must persist this many ms of still-active speech before it aborts "
+             "the reply (on top of the ~150ms vad_start already needs). Guards "
+             "against a loud transient cutting the assistant off. 0 fires "
+             "immediately on vad_start. Default: 120",
+    )
 
     # Sounds
     parser.add_argument(
@@ -1000,6 +1056,7 @@ async def main() -> None:
         local_vad_start_delay_ms=args.local_vad_start_delay_ms,
         vad_rms_threshold=args.vad_rms_threshold,
         vad_rms_window_ms=args.vad_rms_window_ms,
+        barge_in_confirm_ms=args.barge_in_confirm_ms,
         event_sockets=event_sockets,
     )
 

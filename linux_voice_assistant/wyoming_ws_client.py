@@ -258,6 +258,26 @@ class WyomingWsClient:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def tts_playing(self) -> bool:
+        """True while the downlink TTS sink is actively playing a reply.
+
+        Cheap sync bool read (one attribute load on the sink), safe to call from
+        the capture thread for the barge-in gate — a stale read is harmless (see
+        the threading note in __main__).
+        """
+        return self._tts_sink.is_playing
+
+    def barge_in_playback(self) -> None:
+        """Locally abort the in-flight TTS reply (barge-in).
+
+        MUST be scheduled onto the loop thread (the sink lives there) — call via
+        ``loop.call_soon_threadsafe(wyoming_client.barge_in_playback)`` from the
+        capture thread. Spawns the async abort on the loop and returns; the
+        underlying ``_end_session`` is idempotent so a redundant call no-ops.
+        """
+        asyncio.ensure_future(self._tts_sink.barge_in())
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------

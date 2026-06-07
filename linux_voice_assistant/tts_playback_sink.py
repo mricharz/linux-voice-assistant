@@ -75,6 +75,30 @@ class TtsPlaybackSink:
         self._session_active = False
 
     # -----------------------------------------------------------------
+    # Barge-in / state query (called from the capture thread, see __main__)
+    # -----------------------------------------------------------------
+
+    @property
+    def is_playing(self) -> bool:
+        """True while a playback session is active (START seen, no END/STOP yet).
+
+        A plain ``bool`` attribute read with no allocation/syscall/lock. Written
+        only on the loop thread; read cross-thread from the capture thread for
+        the barge-in gate (a stale read is harmless — see __main__).
+        """
+        return self._session_active
+
+    async def barge_in(self) -> None:
+        """Local barge-in: abort the in-flight reply immediately (no drain).
+
+        Distinct from a server-originated STOP frame (:meth:`_on_stop`) so the
+        log makes the trigger source obvious. Reuses the idempotent
+        :meth:`_end_session` — a no-op when nothing is playing.
+        """
+        _LOGGER.info("TTS sink: local barge-in (stop, no drain)")
+        await self._end_session(drain=False)
+
+    # -----------------------------------------------------------------
     # Frame ingest (called per inbound 0x01 downlink WS message)
     # -----------------------------------------------------------------
 
