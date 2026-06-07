@@ -180,6 +180,19 @@ def process_audio(
     realtime_prebuffer_max_bytes = prebuffer_bytes
     realtime_prebuffer_current_bytes = 0
 
+    # RMS gate: rolling window of per-chunk mean-square over vad_rms_window_ms, so
+    # a NEW utterance only starts on SUSTAINED loudness (a single spike — a dropped
+    # remote — averages out). Always rolls; only read as a gate when no utterance
+    # is active. ``_rms_debug`` + the peak/throttle vars drive the once-per-second
+    # --debug RMS log.
+    _chunk_ms = max(1.0, block_size / 16.0)  # 16 samples/ms @ 16kHz
+    rms_window: deque = deque(
+        maxlen=max(1, int(round(state.vad_rms_window_ms / _chunk_ms)))
+    )
+    _rms_debug = _LOGGER.isEnabledFor(logging.DEBUG)
+    rms_last_log = 0.0
+    rms_peak_1s = 0.0
+
     try:
         _LOGGER.debug("Opening audio input device: %s", mic.name)
         with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
@@ -228,23 +241,46 @@ def process_audio(
                                 dropped = realtime_prebuffer.popleft()
                                 realtime_prebuffer_current_bytes -= len(dropped)
 
-                        # Post-TTS cooldown: suppress the VAD *trigger* (not the
-                        # pre-buffer, which keeps rolling above) for
-                        # tts_cooldown_ms after the last playback END, to swallow
-                        # the self-echo tail (AEC residual) without false-
-                        # triggering on it. A real follow-up that starts in the
-                        # window and continues is recovered from the pre-buffer on
-                        # trigger. Only gates a NEW utterance start; an already-
-                        # active utterance is never cut. Barge-in (during playback)
-                        # is unaffected — END hasn't fired yet.
+                        # RMS gate (windowed): only let the VAD START a new
+                        # utterance when the AVERAGE level over the last
+                        # vad_rms_window_ms is loud enough. webrtcvad triggers on
+                        # any voiced-like frame regardless of level, so quiet AEC
+                        # residual / room noise (~RMS 25 int16) otherwise starts
+                        # phantom utterances that Parakeet hallucinates English
+                        # filler on ("Yeah.", "Thank you."). Averaging over a window
+                        # (not a single 30ms chunk) ignores brief spikes and brief
+                        # dips alike. The gate only blocks a NEW start; an already-
+                        # active utterance is never gated, so quiet inter-word gaps
+                        # run through to vad_end. The pre-buffer (above) keeps
+                        # rolling regardless, so the speech onset from BEFORE the
+                        # threshold crossing is still flushed on trigger — the gate
+                        # adds no onset loss. Tunable: --vad-rms-threshold (int16
+                        # RMS; 0 disables) + --vad-rms-window-ms.
+                        rms_window.append(float(np.mean(np.square(audio_chunk_array))))
+                        windowed_rms = float(np.sqrt(np.mean(rms_window))) * 32768.0
                         allow_vad = True
-                        cooldown_ms = getattr(state, "tts_cooldown_ms", 0)
-                        if cooldown_ms > 0 and not realtime_utterance_active:
-                            end_ts = wyoming_client.tts_playback_end_monotonic
-                            if end_ts > 0.0 and (
-                                (time.monotonic() - end_ts) * 1000.0 < cooldown_ms
-                            ):
-                                allow_vad = False
+                        if state.vad_rms_threshold > 0 and not realtime_utterance_active:
+                            allow_vad = windowed_rms >= state.vad_rms_threshold
+
+                        # Debug visibility (only when --debug): once/sec, the
+                        # current windowed RMS + the 1s peak (catches transients
+                        # like a dropped remote) + the gate decision — so we can
+                        # eyeball noise floor vs speech vs transient and tune the
+                        # threshold.
+                        if _rms_debug:
+                            rms_peak_1s = max(rms_peak_1s, windowed_rms)
+                            _rms_now = time.monotonic()
+                            if _rms_now - rms_last_log >= 1.0:
+                                _LOGGER.debug(
+                                    "RMS gate: now=%.0f peak1s=%.0f thr=%d allow=%s active=%s",
+                                    windowed_rms,
+                                    rms_peak_1s,
+                                    state.vad_rms_threshold,
+                                    allow_vad,
+                                    realtime_utterance_active,
+                                )
+                                rms_last_log = _rms_now
+                                rms_peak_1s = 0.0
 
                         for ev in realtime_vad.process(audio_chunk, allow_vad=allow_vad):
                             if ev == "vad_start":
@@ -666,13 +702,21 @@ async def main() -> None:
         help="PulseAudio sink for TTS playback (default: smartspot_ec_sink)",
     )
     parser.add_argument(
-        "--tts-cooldown-ms",
+        "--vad-rms-threshold",
         type=int,
-        default=200,
-        help="Realtime mode: after a TTS playback END, suppress the VAD trigger "
-             "for this many ms to swallow the self-echo tail (AEC residual) "
-             "without false-triggering on it. 0 disables. Barge-in (during "
-             "playback) is unaffected. Default: 200",
+        default=120,
+        help="Realtime mode: minimum windowed RMS (int16 units) required to START "
+             "a new utterance — gates quiet AEC residual / room noise (~RMS 25) "
+             "that webrtcvad would otherwise trigger, causing Parakeet to "
+             "hallucinate filler. 0 disables the gate. Default: 120",
+    )
+    parser.add_argument(
+        "--vad-rms-window-ms",
+        type=int,
+        default=150,
+        help="Realtime mode: window (ms) the RMS gate averages over, so a single "
+             "spike (a dropped remote) doesn't trip it and a brief dip mid-onset "
+             "doesn't either. Default: 150",
     )
 
     # Sounds
@@ -724,6 +768,11 @@ async def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    # Keep the websockets library out of DEBUG even under --debug: it hex-dumps
+    # EVERY binary frame (each audio uplink + each TTS downlink chunk), which
+    # floods the journal and burns real CPU on the Pi Zero formatting hex. Our
+    # own DEBUG logs (RMS gate, VAD events) stay; only the per-frame spam dies.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     _LOGGER.debug(args)
 
     # Configure OTel environment from CLI args before init
@@ -940,7 +989,8 @@ async def main() -> None:
         local_vad_min_speech_ms=args.local_vad_min_speech_ms,
         local_vad_min_silence_ms=args.local_vad_min_silence_ms,
         local_vad_start_delay_ms=args.local_vad_start_delay_ms,
-        tts_cooldown_ms=args.tts_cooldown_ms,
+        vad_rms_threshold=args.vad_rms_threshold,
+        vad_rms_window_ms=args.vad_rms_window_ms,
         event_sockets=event_sockets,
     )
 

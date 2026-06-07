@@ -74,13 +74,6 @@ class TtsPlaybackSink:
         # dropped END (link blip) — we recover by tearing the old stream down.
         self._session_active = False
 
-        # Monotonic ts of the last normal playback END (after drain). Read by the
-        # realtime audio thread to suppress the VAD trigger for a short cooldown
-        # window, swallowing the self-echo tail (AEC residual) without false-
-        # triggering. Deliberately NOT set on STOP (barge-in): the user is already
-        # speaking, so gating their speech would be wrong.
-        self.last_playback_end_monotonic: float = 0.0
-
     # -----------------------------------------------------------------
     # Frame ingest (called per inbound 0x01 downlink WS message)
     # -----------------------------------------------------------------
@@ -207,11 +200,6 @@ class TtsPlaybackSink:
         """END: drain the buffer (let the utterance finish), then free."""
         _LOGGER.info("TTS sink: playback END (draining)")
         await self._end_session(drain=True)
-        # Anchor the post-TTS VAD cooldown here (drain has returned → audio
-        # flushed to the sink). The realtime audio thread suppresses its VAD
-        # trigger for ``tts_cooldown_ms`` from this instant to swallow the
-        # residual self-echo tail.
-        self.last_playback_end_monotonic = time.monotonic()
 
     async def _on_stop(self) -> None:
         """STOP: barge-in — free without draining (abort immediately)."""

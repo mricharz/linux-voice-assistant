@@ -258,15 +258,6 @@ class WyomingWsClient:
     def connected(self) -> bool:
         return self._connected
 
-    @property
-    def tts_playback_end_monotonic(self) -> float:
-        """Monotonic ts of the last normal TTS playback END (0.0 if none yet).
-
-        Exposed for the realtime audio thread's post-TTS VAD cooldown — set on a
-        drained END, NOT on STOP (barge-in).
-        """
-        return self._tts_sink.last_playback_end_monotonic
-
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
