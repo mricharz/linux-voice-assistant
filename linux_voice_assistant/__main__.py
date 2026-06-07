@@ -259,18 +259,33 @@ def process_audio(
                         rms_window.append(float(np.mean(np.square(audio_chunk_array))))
                         windowed_rms = float(np.sqrt(np.mean(rms_window))) * 32768.0
                         allow_vad = True
-                        if state.vad_rms_threshold > 0 and not realtime_utterance_active:
-                            # Band gate: loud enough to be speech (>= threshold) but
-                            # NOT louder than a human can be at this mic (<= max).
-                            # The device hears its own TTS echo as extremely loud
-                            # (windowed RMS ~8000+), far above real speech which tops
-                            # out ~5000 even up close — so an upper bound rejects the
-                            # self-echo phantom without touching the user. max<=0
-                            # disables the cap.
-                            allow_vad = (
-                                windowed_rms >= state.vad_rms_threshold
-                                and (state.vad_rms_max <= 0 or windowed_rms <= state.vad_rms_max)
+                        if not realtime_utterance_active:
+                            # 1) HARD block while WE play our own TTS (+ a tail for
+                            # the acoustic decay). The AEC residual echo of our own
+                            # voice DIPS INTO the speech RMS band — measured: windowed
+                            # RMS ~2638 at a self-echo onset (1s-peak 11512) — so no
+                            # level threshold can separate it from real speech. The
+                            # only reliable discriminator is "we are playing / just
+                            # stopped". Voice barge-in is impossible here regardless
+                            # (the echo is louder than any user can be).
+                            tail_ms = state.vad_tts_tail_ms
+                            tts_block = wyoming_client.tts_active or (
+                                tail_ms > 0
+                                and wyoming_client.tts_playback_end_monotonic > 0.0
+                                and (time.monotonic() - wyoming_client.tts_playback_end_monotonic)
+                                * 1000.0 < tail_ms
                             )
+                            if tts_block:
+                                allow_vad = False
+                            elif state.vad_rms_threshold > 0:
+                                # 2) Otherwise the RMS band handles ambient noise in
+                                # the TTS-free window: loud enough to be speech
+                                # (>= threshold), not louder than a human at this mic
+                                # (<= max; max<=0 disables the cap).
+                                allow_vad = (
+                                    windowed_rms >= state.vad_rms_threshold
+                                    and (state.vad_rms_max <= 0 or windowed_rms <= state.vad_rms_max)
+                                )
 
                         # Debug visibility (only when --debug): once/sec, the
                         # current windowed RMS + the 1s peak (catches transients
@@ -282,11 +297,12 @@ def process_audio(
                             _rms_now = time.monotonic()
                             if _rms_now - rms_last_log >= 1.0:
                                 _LOGGER.debug(
-                                    "RMS gate: now=%.0f peak1s=%.0f thr=%d max=%d allow=%s active=%s",
+                                    "RMS gate: now=%.0f peak1s=%.0f thr=%d max=%d tts=%s allow=%s active=%s",
                                     windowed_rms,
                                     rms_peak_1s,
                                     state.vad_rms_threshold,
                                     state.vad_rms_max,
+                                    wyoming_client.tts_active,
                                     allow_vad,
                                     realtime_utterance_active,
                                 )
@@ -733,11 +749,19 @@ async def main() -> None:
         "--vad-rms-max",
         type=int,
         default=5000,
-        help="Realtime mode: UPPER windowed-RMS bound — a new utterance only "
-             "starts when level is <= this. The device hears its own TTS echo as "
-             "extremely loud (~8000+) vs real speech which tops out ~5000 even up "
-             "close, so this rejects the self-echo phantom. 0 disables the cap. "
-             "Default: 5000",
+        help="Realtime mode: UPPER windowed-RMS bound for the ambient-noise band "
+             "gate (only used while NOT playing TTS) — a new utterance starts only "
+             "when level is <= this. 0 disables the cap. Default: 5000",
+    )
+    parser.add_argument(
+        "--vad-tts-tail-ms",
+        type=int,
+        default=400,
+        help="Realtime mode: hard-block the VAD while our own TTS plays AND for "
+             "this many ms after it ends (acoustic decay). The self-echo dips into "
+             "the speech RMS band so it can't be level-gated; this is the reliable "
+             "guard. 0 = only block during active playback (no post-end tail). "
+             "Default: 400",
     )
 
     # Sounds
@@ -1013,6 +1037,7 @@ async def main() -> None:
         vad_rms_threshold=args.vad_rms_threshold,
         vad_rms_window_ms=args.vad_rms_window_ms,
         vad_rms_max=args.vad_rms_max,
+        vad_tts_tail_ms=args.vad_tts_tail_ms,
         event_sockets=event_sockets,
     )
 

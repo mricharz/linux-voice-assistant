@@ -74,6 +74,13 @@ class TtsPlaybackSink:
         # dropped END (link blip) — we recover by tearing the old stream down.
         self._session_active = False
 
+        # Monotonic ts of the last END/STOP — the realtime audio thread suppresses
+        # the VAD for a short tail after this to swallow the post-playback acoustic
+        # decay (the AEC residual echo of our own TTS is louder than any user, so
+        # it can't be separated by level — the only reliable signal is "we are
+        # playing / just stopped").
+        self.last_playback_end_monotonic: float = 0.0
+
     # -----------------------------------------------------------------
     # Frame ingest (called per inbound 0x01 downlink WS message)
     # -----------------------------------------------------------------
@@ -200,11 +207,13 @@ class TtsPlaybackSink:
         """END: drain the buffer (let the utterance finish), then free."""
         _LOGGER.info("TTS sink: playback END (draining)")
         await self._end_session(drain=True)
+        self.last_playback_end_monotonic = time.monotonic()
 
     async def _on_stop(self) -> None:
         """STOP: barge-in — free without draining (abort immediately)."""
         _LOGGER.info("TTS sink: playback STOP (barge-in, no drain)")
         await self._end_session(drain=False)
+        self.last_playback_end_monotonic = time.monotonic()
 
     def _on_metadata(self, frame: bytes) -> None:
         """Standalone METADATA frame: 0x05 + u32 LE length + JSON bytes.
