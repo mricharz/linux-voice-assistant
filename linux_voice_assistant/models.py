@@ -116,6 +116,10 @@ class ServerState:
     # 0 disables.
     vad_rms_threshold: int = 120
     vad_rms_window_ms: int = 150
+    # Upper RMS bound: the device hears its own TTS echo as extremely loud
+    # (~8000+) vs real speech (~5000 max even up close), so a new utterance only
+    # starts when the windowed RMS is <= this. 0 disables the cap.
+    vad_rms_max: int = 6000
 
     # Entities
     media_player_entity: "Optional[MediaPlayerEntity]" = None

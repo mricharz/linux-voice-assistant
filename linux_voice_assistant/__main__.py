@@ -260,7 +260,17 @@ def process_audio(
                         windowed_rms = float(np.sqrt(np.mean(rms_window))) * 32768.0
                         allow_vad = True
                         if state.vad_rms_threshold > 0 and not realtime_utterance_active:
-                            allow_vad = windowed_rms >= state.vad_rms_threshold
+                            # Band gate: loud enough to be speech (>= threshold) but
+                            # NOT louder than a human can be at this mic (<= max).
+                            # The device hears its own TTS echo as extremely loud
+                            # (windowed RMS ~8000+), far above real speech which tops
+                            # out ~5000 even up close — so an upper bound rejects the
+                            # self-echo phantom without touching the user. max<=0
+                            # disables the cap.
+                            allow_vad = (
+                                windowed_rms >= state.vad_rms_threshold
+                                and (state.vad_rms_max <= 0 or windowed_rms <= state.vad_rms_max)
+                            )
 
                         # Debug visibility (only when --debug): once/sec, the
                         # current windowed RMS + the 1s peak (catches transients
@@ -272,10 +282,11 @@ def process_audio(
                             _rms_now = time.monotonic()
                             if _rms_now - rms_last_log >= 1.0:
                                 _LOGGER.debug(
-                                    "RMS gate: now=%.0f peak1s=%.0f thr=%d allow=%s active=%s",
+                                    "RMS gate: now=%.0f peak1s=%.0f thr=%d max=%d allow=%s active=%s",
                                     windowed_rms,
                                     rms_peak_1s,
                                     state.vad_rms_threshold,
+                                    state.vad_rms_max,
                                     allow_vad,
                                     realtime_utterance_active,
                                 )
@@ -718,6 +729,16 @@ async def main() -> None:
              "spike (a dropped remote) doesn't trip it and a brief dip mid-onset "
              "doesn't either. Default: 150",
     )
+    parser.add_argument(
+        "--vad-rms-max",
+        type=int,
+        default=6000,
+        help="Realtime mode: UPPER windowed-RMS bound — a new utterance only "
+             "starts when level is <= this. The device hears its own TTS echo as "
+             "extremely loud (~8000+) vs real speech which tops out ~5000 even up "
+             "close, so this rejects the self-echo phantom. 0 disables the cap. "
+             "Default: 6000",
+    )
 
     # Sounds
     parser.add_argument(
@@ -991,6 +1012,7 @@ async def main() -> None:
         local_vad_start_delay_ms=args.local_vad_start_delay_ms,
         vad_rms_threshold=args.vad_rms_threshold,
         vad_rms_window_ms=args.vad_rms_window_ms,
+        vad_rms_max=args.vad_rms_max,
         event_sockets=event_sockets,
     )
 
