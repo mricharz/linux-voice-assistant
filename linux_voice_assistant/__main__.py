@@ -732,12 +732,12 @@ async def main() -> None:
     parser.add_argument(
         "--vad-rms-max",
         type=int,
-        default=6000,
+        default=5000,
         help="Realtime mode: UPPER windowed-RMS bound — a new utterance only "
              "starts when level is <= this. The device hears its own TTS echo as "
              "extremely loud (~8000+) vs real speech which tops out ~5000 even up "
              "close, so this rejects the self-echo phantom. 0 disables the cap. "
-             "Default: 6000",
+             "Default: 5000",
     )
 
     # Sounds
