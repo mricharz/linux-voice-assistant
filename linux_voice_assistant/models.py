@@ -110,6 +110,10 @@ class ServerState:
     local_vad_min_speech_ms: int = 150
     local_vad_min_silence_ms: int = 600
     local_vad_start_delay_ms: int = 0  # optional "ignore first N ms" after wake
+    # Realtime mode: after a TTS playback END, suppress the VAD trigger for this
+    # many ms to swallow the self-echo tail (AEC residual). 0 disables. Barge-in
+    # (during playback) is unaffected — this only gates after END.
+    tts_cooldown_ms: int = 200
 
     # Entities
     media_player_entity: "Optional[MediaPlayerEntity]" = None

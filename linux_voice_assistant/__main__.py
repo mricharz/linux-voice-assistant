@@ -228,7 +228,25 @@ def process_audio(
                                 dropped = realtime_prebuffer.popleft()
                                 realtime_prebuffer_current_bytes -= len(dropped)
 
-                        for ev in realtime_vad.process(audio_chunk, allow_vad=True):
+                        # Post-TTS cooldown: suppress the VAD *trigger* (not the
+                        # pre-buffer, which keeps rolling above) for
+                        # tts_cooldown_ms after the last playback END, to swallow
+                        # the self-echo tail (AEC residual) without false-
+                        # triggering on it. A real follow-up that starts in the
+                        # window and continues is recovered from the pre-buffer on
+                        # trigger. Only gates a NEW utterance start; an already-
+                        # active utterance is never cut. Barge-in (during playback)
+                        # is unaffected — END hasn't fired yet.
+                        allow_vad = True
+                        cooldown_ms = getattr(state, "tts_cooldown_ms", 0)
+                        if cooldown_ms > 0 and not realtime_utterance_active:
+                            end_ts = wyoming_client.tts_playback_end_monotonic
+                            if end_ts > 0.0 and (
+                                (time.monotonic() - end_ts) * 1000.0 < cooldown_ms
+                            ):
+                                allow_vad = False
+
+                        for ev in realtime_vad.process(audio_chunk, allow_vad=allow_vad):
                             if ev == "vad_start":
                                 prebuf_ms = realtime_prebuffer_current_bytes // 32  # bytes to ms at 16kHz s16le
                                 _LOGGER.debug(
@@ -647,6 +665,15 @@ async def main() -> None:
         default="smartspot_ec_sink",
         help="PulseAudio sink for TTS playback (default: smartspot_ec_sink)",
     )
+    parser.add_argument(
+        "--tts-cooldown-ms",
+        type=int,
+        default=200,
+        help="Realtime mode: after a TTS playback END, suppress the VAD trigger "
+             "for this many ms to swallow the self-echo tail (AEC residual) "
+             "without false-triggering on it. 0 disables. Barge-in (during "
+             "playback) is unaffected. Default: 200",
+    )
 
     # Sounds
     parser.add_argument(
@@ -913,6 +940,7 @@ async def main() -> None:
         local_vad_min_speech_ms=args.local_vad_min_speech_ms,
         local_vad_min_silence_ms=args.local_vad_min_silence_ms,
         local_vad_start_delay_ms=args.local_vad_start_delay_ms,
+        tts_cooldown_ms=args.tts_cooldown_ms,
         event_sockets=event_sockets,
     )
 
