@@ -55,8 +55,48 @@ class _pa_buffer_attr(ctypes.Structure):
 
 
 def _load_libpulse() -> ctypes.CDLL:
-    """Load libpulse-simple shared library."""
-    return ctypes.CDLL("libpulse-simple.so.0")
+    """Load libpulse-simple and declare the ctypes signatures.
+
+    Declaring ``argtypes``/``restype`` is load-bearing, NOT cosmetic: without
+    them ctypes assumes ``c_int`` (32-bit) for every return value.
+    ``pa_simple_new`` returns a ``pa_simple*`` (64-bit on aarch64/x86-64), so the
+    default would TRUNCATE the pointer to 32 bits — the truncated handle passes
+    the ``if not self._stream`` non-null check but is corrupt, and the first
+    ``pa_simple_write`` then dereferences garbage → SIGSEGV. Pinning the
+    signatures keeps the pointer intact (64-bit ``c_void_p``).
+    """
+    lib = ctypes.CDLL("libpulse-simple.so.0")
+
+    # pa_simple* pa_simple_new(server, name, dir, dev, stream_name,
+    #                          *ss, *map, *attr, *error)
+    lib.pa_simple_new.restype = ctypes.c_void_p
+    lib.pa_simple_new.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(_pa_sample_spec),
+        ctypes.c_void_p,
+        ctypes.POINTER(_pa_buffer_attr),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    # int pa_simple_write(pa_simple *s, const void *data, size_t bytes, int *error)
+    lib.pa_simple_write.restype = ctypes.c_int
+    lib.pa_simple_write.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    # int pa_simple_drain(pa_simple *s, int *error)
+    lib.pa_simple_drain.restype = ctypes.c_int
+    lib.pa_simple_drain.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    # void pa_simple_free(pa_simple *s)
+    lib.pa_simple_free.restype = None
+    lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+
+    return lib
 
 
 class _PulsePlayback:
