@@ -299,6 +299,87 @@ python3 -m linux_voice_assistant ... \
      --audio-output-device 'pipewire/echo-cancel-sink'
 ```
 
+> **Note — realtime mode has two output paths.** `--audio-output-device` is only
+> used by the **mpv** player (wake chime, music, timers). The streamed TTS reply
+> (the BFF `/v1/satellite/link` downlink) is played by `TtsPlaybackSink` and
+> goes to the sink named by **`--tts-pcm-sink`** (default `smartspot_ec_sink`).
+> For echo cancellation it is `--tts-pcm-sink` that must point at the echo-cancel
+> sink — pointing only `--audio-output-device` there cancels chimes but not the
+> voice reply.
+
+### Tuning AEC on weak hardware (Raspberry Pi Zero 2 W / SmartSpot)
+
+Hard-won notes from getting `module-echo-cancel`/`webrtc` to actually cancel on a
+Pi Zero 2 W with a Seeed 2-mic (WM8960) card. The defaults *load* fine but the
+device hears itself; the fixes below are what make it work.
+
+**1. webrtc is locked to 16 kHz — align the whole chain to 16 kHz.**
+`aec_method=webrtc` **ignores the `rate=` argument** and always runs the
+echo-cancel source/sink at 16000 Hz (pass `rate=24000` and the devices still come
+up at 16000). If the sound card runs at a different rate (e.g. 22050/24000/48000),
+the AEC *reference* (tapped at 16 kHz) is resampled before it reaches the speaker,
+so it no longer matches the acoustic echo at the mic → poor cancellation. Run the
+**card at 16 kHz** so reference == emission and the mic/playback paths are
+resample-free:
+
+``` sh
+# /etc/pulse/daemon.conf
+default-sample-rate = 16000
+alternate-sample-rate = 16000
+```
+
+This is lossless here because the TTS is already 16 kHz on the wire; >16 kHz voice
+and webrtc echo-cancellation are mutually exclusive (the EC sink is a 16 kHz
+chokepoint). For higher-rate output with cancellation you need a different
+canceller (`aec_method=speex` at any rate, but weaker) or hardware AEC.
+
+**2. Give PulseAudio real-time priority — this is the big one.**
+The classic symptom (cancellation holds, then collapses for ~1–2 s, then
+recovers, at random times) is **not** a clock/delay problem — it is the AEC thread
+being preempted under load (wake-word inference, a 24/7 camera stream, kernel
+work) and missing its audio deadline. By default PulseAudio runs `SCHED_OTHER`
+(`ps -eLo cls,rtprio,comm | grep pulse` shows `TS`/no rtprio). Fix:
+
+``` sh
+# /etc/security/limits.d/99-pulse-rt.conf
+@audio   -  rtprio  95
+@audio   -  nice    -19
+```
+``` sh
+# /etc/pulse/daemon.conf
+high-priority = yes
+nice-level = -11
+realtime-scheduling = yes
+realtime-priority = 5
+```
+
+Reboot (PAM limits apply at login). Verify the audio threads are now real-time:
+
+``` sh
+ps -L -p "$(pgrep -x pulseaudio)" -o tid,cls,rtprio,comm   # alsa-sink/alsa-source → RR 5
+```
+
+This took the dropouts from several full collapses per 20 s down to ~0–1 brief
+dips, i.e. it is what makes the AEC usable in practice.
+
+**3. Measure AEC with broadband noise, never a tone.**
+A single-frequency tone is the worst case for the LMS adaptive filter (too little
+spectral excitation — it never locks) and will read ~15 dB even when the AEC is
+fine. Play ~20 s of **continuous pink/broadband noise** into the echo-cancel sink,
+record the echo-cancel source (post-AEC) and the raw mic (pre-AEC) in parallel,
+and compute windowed RMS over time. A healthy setup converges within ~2 s and
+holds **~60 dB** of cancellation; the failure mode shows up as transient windows
+where it drops to <10 dB.
+
+**4. CPU notes.**
+Steady PulseAudio CPU (~15–20 % of one core on a Pi Zero) is dominated by the
+always-on webrtc AEC plus audio-thread wakeups — **not** by resampling, so moving
+to 16 kHz does not noticeably lower it. `module-udev-detect tsched=1` halves the
+*idle* cost but a voice satellite is never idle (mic always on), so there is no
+real-world win, and `tsched=1` can trigger the Seeed `snd_soc_simple_card` timer
+bug (`ALSA woke us up … nothing to read`). Keep `tsched=0` on this card. ~18 % is
+effectively the floor for running webrtc AEC + always-on audio 24/7 here.
+
 <!-- Links -->
 [linux-voice-assistant]: https://github.com/OHF-Voice/linux-voice-assistant
 [homeassistant]: https://www.home-assistant.io/
