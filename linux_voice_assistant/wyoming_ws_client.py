@@ -258,21 +258,6 @@ class WyomingWsClient:
     def connected(self) -> bool:
         return self._connected
 
-    @property
-    def tts_active(self) -> bool:
-        """True while a TTS playback session is in flight (START..END/STOP).
-
-        The realtime audio thread reads this to hard-block the VAD while we play
-        our own TTS — the AEC residual echo is louder than any user, so it can't
-        be separated by level.
-        """
-        return self._tts_sink._session_active
-
-    @property
-    def tts_playback_end_monotonic(self) -> float:
-        """Monotonic ts of the last TTS playback END/STOP (0.0 if none yet)."""
-        return self._tts_sink.last_playback_end_monotonic
-
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------

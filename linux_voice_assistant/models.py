@@ -116,15 +116,6 @@ class ServerState:
     # 0 disables.
     vad_rms_threshold: int = 120
     vad_rms_window_ms: int = 150
-    # Upper RMS bound: the device hears its own TTS echo as extremely loud
-    # (~8000+) vs real speech (~5000 max even up close), so a new utterance only
-    # starts when the windowed RMS is <= this. 0 disables the cap.
-    vad_rms_max: int = 5000
-    # Hard VAD block while our own TTS plays + this tail (ms) after it ends — the
-    # AEC residual echo dips into the speech RMS band so it can't be level-gated;
-    # "we are playing" is the only reliable signal. 0 disables (TTS-active still
-    # blocks; only the post-end tail is dropped).
-    vad_tts_tail_ms: int = 400
 
     # Entities
     media_player_entity: "Optional[MediaPlayerEntity]" = None
